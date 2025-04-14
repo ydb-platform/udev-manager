@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"extensions": {
+		"recommendations": [
+			"golang.go",
+			"fill-labs.dependi",
+			"ms-vscode.makefile-tools",
+			"redhat.vscode-yaml",
+			"usernamehw.errorlens",
+		]
+	}
+}
