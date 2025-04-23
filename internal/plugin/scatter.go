@@ -8,20 +8,23 @@ import (
 )
 
 type Scatter[T Instance] struct {
-	mapper         FromDevice[T]
-	registry       *Registry
-	resourceDomain string
-	resourcePrefix string
-	routes         map[Id]Resource
+	templater FromDevice[*ResourceTemplate]
+	mapper    FromDevice[[]T]
+	registry  *Registry
+	routes    map[ResourceTemplate]Resource
 }
 
-func NewScatter[T Instance](d udev.Discovery, registry *Registry, resourceDomain, resourcePrefix string, mapper FromDevice[T]) mux.CancelFunc {
+func NewScatter[T Instance](
+	d udev.Discovery,
+	registry *Registry,
+	templater FromDevice[*ResourceTemplate],
+	mapper FromDevice[[]T],
+) mux.CancelFunc {
 	scatter := &Scatter[T]{
-		mapper:         mapper,
-		registry:       registry,
-		resourceDomain: resourceDomain,
-		resourcePrefix: resourcePrefix,
-		routes:         make(map[Id]Resource),
+		templater: templater,
+		mapper:    mapper,
+		registry:  registry,
+		routes:    make(map[ResourceTemplate]Resource),
 	}
 	ch := make(chan udev.Event)
 
@@ -30,13 +33,100 @@ func NewScatter[T Instance](d udev.Discovery, registry *Registry, resourceDomain
 	return d.Subscribe(mux.SinkFromChan(ch))
 }
 
-func (s *Scatter[T]) add(id Id, resource Resource) {
-	err := s.registry.Add(resource)
-	if err != nil {
-		klog.Errorf("failed to add resource %s: %v", resource.Name, err)
+func (s *Scatter[T]) added(dev udev.Device) {
+	if dev == nil {
+		klog.Errorf("device is nil")
 		return
 	}
-	s.routes[id] = resource
+
+	template, err := s.templater(dev)
+	if err != nil {
+		klog.Errorf("failed to create resource template for device %q, caused by %q", dev.Debug(), err.Error())
+		return
+	}
+
+	if template == nil {
+		klog.V(5).Info("unmatched device: %q, template is nil", dev.Debug())
+		return
+	}
+
+	instances, err := s.mapper(dev)
+	if err != nil {
+		klog.Errorf("failed to map device %q to instances, caused by %q", dev.Debug(), err.Error())
+		return
+	}
+
+	klog.V(5).Info("Init: Matched device: %q", dev.Debug())
+
+	if res, ok := s.routes[*template]; ok {
+		klog.V(5).Info("Init: Matched resource: %s", res.Name())
+		res.Submit(HealthEvent{
+			Instances: unpack(instances...),
+			Health:    Healthy{},
+		})
+		return
+	}
+
+	res := &resource{
+		resourceTemplate: *template,
+		instances:        make(map[Id]Instance),
+		healthCh:        make(chan HealthEvent),
+	}
+
+	for _, instance := range instances {
+		res.instances[instance.Id()] = instance
+	}
+
+	err = s.registry.Add(res)
+	if err != nil {
+		klog.Errorf("failed to add resource %s: %v", res.Name(), err)
+		return
+	}
+	s.routes[*template] = res
+}
+
+func (s *Scatter[T]) removed(dev udev.Device) {
+	if dev == nil {
+		klog.Errorf("device is nil")
+		return
+	}
+
+	template, err := s.templater(dev)
+	if err != nil {
+		klog.Errorf("failed to create resource template for 'Removed' event for device %q, caused by %q", dev.Debug(), err.Error())
+		return
+	}
+
+	if template == nil {
+		klog.V(5).Info("unmatched device: %q, template is nil", dev.Debug())
+		return
+	}
+
+	instances, err := s.mapper(dev)
+	if err != nil {
+		klog.Errorf("failed to map device %q to instances for 'Removed', caused by %q", dev.Debug(), err.Error())
+		return
+	}
+
+	klog.V(5).Info("Removed: Matched device: %q", dev.Debug())
+
+	if res, ok := s.routes[*template]; ok {
+		klog.V(5).Info("Removed: Matched resource: %s", res.Name())
+		res.Submit(HealthEvent{
+			Instances: unpack(instances...),
+			Health:    Unhealthy{},
+		})
+	} else {
+		klog.Errorf("failed to find resource for 'Removed' event for device %q", dev.Debug())
+	}
+}
+
+func unpack[T Instance](instances ...T) []Instance {
+	result := make([]Instance, len(instances))
+	for i, instance := range instances {
+		result[i] = instance
+	}
+	return result
 }
 
 func (s *Scatter[T]) run(evCh <-chan udev.Event) {
@@ -44,52 +134,12 @@ func (s *Scatter[T]) run(evCh <-chan udev.Event) {
 		switch ev := ev.(type) {
 		case udev.Init:
 			for _, dev := range ev.Devices {
-				maybeInstance := s.mapper(dev)
-				if maybeInstance == nil {
-					continue
-				}
-				klog.V(5).Info("Init: Matched device: %s", dev.Debug())
-				instance := *maybeInstance
-				id := instance.Id()
-				if _, ok := s.routes[id]; ok {
-					continue
-				}
-				resource := &singletonResource{
-					resourcePrefix: s.resourceDomain + "/" + s.resourcePrefix,
-					instance:       instance,
-					healthCh:       make(chan HealthEvent),
-				}
-				s.add(id, resource)
+				s.added(dev)
 			}
 		case udev.Added:
-			maybeInstance := s.mapper(ev.Device)
-			if maybeInstance == nil {
-				continue
-			}
-			klog.V(5).Info("Added: Matched device: %s", ev.Device.Debug())
-			instance := *maybeInstance
-			id := instance.Id()
-			if resource, ok := s.routes[id]; ok {
-				resource.Submit(HealthEvent{instance, Healthy{}})
-			} else {
-				resource := &singletonResource{
-					resourcePrefix: s.resourcePrefix,
-					instance:       instance,
-					healthCh:       make(chan HealthEvent),
-				}
-				s.add(id, resource)
-			}
+			s.added(ev.Device)
 		case udev.Removed:
-			maybeInstance := s.mapper(ev.Device)
-			if maybeInstance == nil {
-				continue
-			}
-			klog.V(5).Info("Removed: Matched device: %s", ev.Device.Debug())
-			instance := *maybeInstance
-			id := instance.Id()
-			if resource, ok := s.routes[id]; ok {
-				resource.Submit(HealthEvent{instance, Unhealthy{}})
-			}
+			s.removed(ev.Device)
 		}
 	}
 }

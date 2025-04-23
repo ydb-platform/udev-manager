@@ -63,16 +63,10 @@ func (h *healthInstance) Allocate(ctx context.Context) (*pluginapi.ContainerAllo
 	return h.Instance.Allocate(ctx)
 }
 
-type FromDevice[T Instance] func(dev udev.Device) *T
-
-func (f FromDevice[T]) AsFilter() mux.FilterFunc[udev.Device] {
-	return func(dev udev.Device) bool {
-		return f(dev) != nil
-	}
-}
+type FromDevice[T any] func(dev udev.Device) (T, error)
 
 type HealthEvent struct {
-	Instance
+	Instances []Instance
 	Health
 }
 
@@ -81,6 +75,53 @@ type Resource interface {
 	Name() string
 	Instances() map[Id]Instance
 	ListAndWatch(context.Context) <-chan []Instance
+}
+
+type ResourceTemplate struct {
+	Domain string
+	Prefix string
+}
+
+type resource struct {
+	resourceTemplate ResourceTemplate
+	instances map[Id]Instance
+	healthCh   chan HealthEvent
+}
+
+func (r *resource) Name() string {
+	return r.resourceTemplate.Domain + "/" + r.resourceTemplate.Prefix
+}
+
+func (r *resource) Instances() map[Id]Instance {
+	return r.instances
+}
+
+func (r *resource) Submit(ev HealthEvent) error {
+	r.healthCh <- ev
+	return nil
+}
+
+func (r *resource) run(instanceCh chan<- []Instance) {
+	defer close(instanceCh)
+	instanceCh <- []Instance{}
+	for ev := range r.healthCh {
+		for _, instance := range ev.Instances {
+			r.instances[instance.Id()] = instance
+		}
+		instanceCh <- ev.Instances
+	}
+}
+
+func (r *resource) ListAndWatch(ctx context.Context) <-chan []Instance {
+	ch := make(chan []Instance, 1)
+
+	go r.run(ch)
+
+	return ch
+}
+
+func (r *resource) Close() {
+	close(r.healthCh)
 }
 
 type singletonResource struct {

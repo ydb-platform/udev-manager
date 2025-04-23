@@ -54,9 +54,8 @@ func main() {
 			plugin.NewScatter(
 				devDiscovery,
 				registry,
-				domain,
-				"part-",
-				plugin.PartitionLabelMatcher(domain, partConfig.matcher),
+				plugin.PartitionLabelMatcherTemplater(domain, partConfig.matcher),
+				plugin.PartitionLabelMatcherInstances(domain, partConfig.matcher),
 			),
 			cancel,
 		)
