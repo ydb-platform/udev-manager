@@ -103,7 +103,11 @@ func (r *resource) Submit(ev HealthEvent) error {
 
 func (r *resource) run(instanceCh chan<- []Instance) {
 	defer close(instanceCh)
-	instanceCh <- []Instance{}
+	instances := make([]Instance, 0, len(r.instances))
+	for _, instance := range r.instances {
+		instances = append(instances, instance)
+	}
+	instanceCh <- instances
 	for ev := range r.healthCh {
 		for _, instance := range ev.Instances {
 			r.instances[instance.Id()] = instance
@@ -121,50 +125,5 @@ func (r *resource) ListAndWatch(ctx context.Context) <-chan []Instance {
 }
 
 func (r *resource) Close() {
-	close(r.healthCh)
-}
-
-type singletonResource struct {
-	resourcePrefix string
-	instance       Instance
-	healthCh       chan HealthEvent
-}
-
-func (r *singletonResource) Name() string {
-	return r.resourcePrefix + string(r.instance.Id())
-}
-
-func (r *singletonResource) Instances() map[Id]Instance {
-	return map[Id]Instance{
-		r.instance.Id(): r.instance,
-	}
-}
-
-func (r *singletonResource) Submit(ev HealthEvent) error {
-	r.healthCh <- ev
-	return nil
-}
-
-func (r *singletonResource) run(instanceCh chan<- []Instance) {
-	defer close(instanceCh)
-	instanceCh <- []Instance{r.instance}
-	for ev := range r.healthCh {
-		r.instance = &healthInstance{
-			Instance: r.instance,
-			health:   ev.Health,
-		}
-		instanceCh <- []Instance{r.instance}
-	}
-}
-
-func (r *singletonResource) ListAndWatch(ctx context.Context) <-chan []Instance {
-	ch := make(chan []Instance, 1)
-
-	go r.run(ch)
-
-	return ch
-}
-
-func (r *singletonResource) Close() {
 	close(r.healthCh)
 }

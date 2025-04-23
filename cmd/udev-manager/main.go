@@ -61,6 +61,18 @@ func main() {
 		)
 	}
 
+	for _, netBWConfig := range flags.config.NetworkBandwidth {
+		cancel = mux.ChainCancelFunc(
+			plugin.NewScatter(
+				devDiscovery,
+				registry,
+				plugin.NetBWMatcherTemplater(domain, netBWConfig.matcher),
+				plugin.NetBWMatcherInstances(domain, netBWConfig.matcher, netBWConfig.MbpsPerShare),
+			),
+			cancel,
+		)
+	}
+
 	klog.Info("Starting /healthz server on port :8080")
 	go func() {
 		http.HandleFunc("/healthz", registry.Healthz)
@@ -224,10 +236,28 @@ func (hc *HostDevConfig) validate() error {
 	return nil
 }
 
+type NetBWConfig struct {
+	Matcher      string `yaml:"matcher"` // matcher should be a valid regular expression
+	MbpsPerShare uint   `yaml:"mbpsPerShare"`
+
+	matcher *regexp.Regexp // compiled matcher if the config is valid
+}
+
+func (nbc *NetBWConfig) validate() error {
+	// Compile the regular expression
+	matcher, err := regexp.Compile(nbc.Matcher)
+	if err != nil {
+		return fmt.Errorf(".matcher: %q must be a valid regexp: %w", nbc.Matcher, err)
+	}
+	nbc.matcher = matcher
+	return nil
+}
+
 type Config struct {
-	DeviceDomain string             `yaml:"domain"`
-	Partitions   []PartitionsConfig `yaml:"partitions"`
-	HostDevs     []HostDevConfig    `yaml:"hostdevs"`
+	DeviceDomain     string             `yaml:"domain"`
+	Partitions       []PartitionsConfig `yaml:"partitions"`
+	HostDevs         []HostDevConfig    `yaml:"hostdevs"`
+	NetworkBandwidth []NetBWConfig      `yaml:"networkBandwidth"`
 }
 
 var (
@@ -255,6 +285,13 @@ func (c *Config) validate() error {
 	for i := range c.HostDevs {
 		if err := c.HostDevs[i].validate(); err != nil {
 			errs = errors.Join(errs, fmt.Errorf(".hostdevs[%d]%w", i, err))
+		}
+	}
+
+	// Validate network bandwidth
+	for i := range c.NetworkBandwidth {
+		if err := c.NetworkBandwidth[i].validate(); err != nil {
+			errs = errors.Join(errs, fmt.Errorf(".networkBandwidth[%d]%w", i, err))
 		}
 	}
 
