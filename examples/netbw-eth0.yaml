@@ -1,0 +1,4 @@
+domain: 'ydb.tech'
+networkBandwidth:
+  - matcher: '(^eth0$)'
+    mbpsPerShare: 1000
