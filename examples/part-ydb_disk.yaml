@@ -1,0 +1,3 @@
+domain: 'ydb.tech'
+partitions:
+  - matcher: 'ydb_disk_(.*)'
