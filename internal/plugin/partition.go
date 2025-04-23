@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"regexp"
 	"strings"
@@ -83,24 +84,52 @@ func (p *partition) Allocate(context.Context) (*pluginapi.ContainerAllocateRespo
 	return response, nil
 }
 
-func PartitionLabelMatcher(domain string, matcher *regexp.Regexp) FromDevice[*partition] {
-	return func(dev udev.Device) **partition {
-		var part *partition
+func PartitionLabelMatcherTemplater(domain string, matcher *regexp.Regexp) FromDevice[*ResourceTemplate] {
+	return func(dev udev.Device) (*ResourceTemplate, error) {
 		if dev.Subsystem() != udev.BlockSubsystem {
-			return nil
+			return nil, nil
 		}
 		if dev.DevType() != udev.DeviceTypePart {
-			return nil
+			return nil, nil
 		}
 
 		partlabel, found := dev.Properties()[udev.PropertyPartName]
 		if !found {
-			return nil
+			return nil, nil
 		}
 
 		matches := matcher.FindStringSubmatch(partlabel)
 		if len(matches) == 0 {
-			return nil
+			return nil, nil
+		}
+
+		partlabel = strings.Join(matches[1:], "_")
+
+		return &ResourceTemplate{
+			Domain: domain,
+			Prefix: fmt.Sprintf("part-%s", partlabel),
+		}, nil
+	}
+}
+
+func PartitionLabelMatcherInstances(domain string, matcher *regexp.Regexp) FromDevice[[]*partition] {
+	return func(dev udev.Device) ([]*partition, error) {
+		var part *partition
+		if dev.Subsystem() != udev.BlockSubsystem {
+			return nil, nil
+		}
+		if dev.DevType() != udev.DeviceTypePart {
+			return nil, nil
+		}
+
+		partlabel, found := dev.Properties()[udev.PropertyPartName]
+		if !found {
+			return nil, nil
+		}
+
+		matches := matcher.FindStringSubmatch(partlabel)
+		if len(matches) == 0 {
+			return nil, nil
 		}
 
 		if len(matches) > 1 {
@@ -113,6 +142,6 @@ func PartitionLabelMatcher(domain string, matcher *regexp.Regexp) FromDevice[*pa
 			dev:    dev,
 		}
 
-		return &part
+		return []*partition{part}, nil
 	}
 }
