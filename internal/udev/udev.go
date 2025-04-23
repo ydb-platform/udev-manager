@@ -17,6 +17,7 @@ import (
 
 const (
 	BlockSubsystem = "block"
+	NetSubsystem   = "net"
 
 	DeviceTypeKey  = "DEVTYPE"
 	DeviceTypePart = "partition"
@@ -24,10 +25,15 @@ const (
 	PropertyPartName    = "PARTNAME"
 	PropertyModel       = "ID_MODEL"
 	PropertyShortSerial = "ID_SERIAL_SHORT"
+	
+	PropertyInterface = "INTERFACE"
 
 	SysAttrWWID   = "wwid"
 	SysAttrModel  = "model"
 	SysAttrSerial = "serial"
+
+	SysAttrSpeed = "speed"
+	SysAttrOperstate = "operstate"
 
 	ActionAdd     = "add"
 	ActionRemove  = "remove"
