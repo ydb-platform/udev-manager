@@ -50,12 +50,16 @@ func main() {
 
 	var cancel mux.CancelFunc = mux.CancelFunc(appCancel)
 	for _, partConfig := range flags.config.Partitions {
+		partDomain := partConfig.DomainOverride
+		if partDomain == "" {
+			partDomain = domain
+		}
 		cancel = mux.ChainCancelFunc(
 			plugin.NewScatter(
 				devDiscovery,
 				registry,
-				plugin.PartitionLabelMatcherTemplater(domain, partConfig.matcher),
-				plugin.PartitionLabelMatcherInstances(domain, partConfig.matcher),
+				plugin.PartitionLabelMatcherTemplater(partDomain, partConfig.matcher),
+				plugin.PartitionLabelMatcherInstances(partDomain, partConfig.matcher),
 			),
 			cancel,
 		)
@@ -200,13 +204,23 @@ func initFlags() FlagValues {
 	return values
 }
 
+var (
+	deviceDomainRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
+)
+
 type PartitionsConfig struct {
 	Matcher string `yaml:"matcher"` // matcher should be a valid regular expression
+	DomainOverride string `yaml:"domain,omitempty"` // optional override for the domain
 
 	matcher *regexp.Regexp // compiled matcher if the config is valid
 }
 
 func (pc *PartitionsConfig) validate() error {
+	if pc.DomainOverride != "" {
+		if !deviceDomainRegex.MatchString(pc.DomainOverride) {
+			return fmt.Errorf(".domain: %q must be a valid domain name", pc.DomainOverride)
+		}
+	}
 	// Compile the regular expression
 	matcher, err := regexp.Compile(pc.Matcher)
 	if err != nil {
@@ -259,10 +273,6 @@ type Config struct {
 	HostDevs         []HostDevConfig    `yaml:"hostdevs"`
 	NetworkBandwidth []NetBWConfig      `yaml:"networkBandwidth"`
 }
-
-var (
-	deviceDomainRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
-)
 
 func (c *Config) validate() error {
 	var errs error
