@@ -10,17 +10,17 @@ type MapperFunc[T, U any] func(T) U
 
 func Filter[T any](in In[T], filter FilterFunc[T]) In[T] {
 	out := make(chan T)
-	
+
 	go func() {
 		defer close(out)
-		
+
 		for v := range in {
 			if filter(v) {
 				out <- v
 			}
 		}
 	}()
-	
+
 	return out
 }
 
@@ -70,7 +70,7 @@ func IsNil[T any](v T) bool {
 	case reflect.Chan, reflect.Func, reflect.Map, reflect.Ptr, reflect.UnsafePointer, reflect.Slice:
 		return rv.IsNil()
 	}
-	
+
 	return false
 }
 

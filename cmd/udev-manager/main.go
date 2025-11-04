@@ -59,7 +59,7 @@ func main() {
 				devDiscovery,
 				registry,
 				plugin.PartitionLabelMatcherTemplater(partDomain, partConfig.matcher),
-				plugin.PartitionLabelMatcherInstances(partDomain, partConfig.matcher),
+				plugin.PartitionLabelMatcherInstances(partDomain, partConfig.matcher, flags.config.DisableTopologyHints),
 			),
 			cancel,
 		)
@@ -209,7 +209,7 @@ var (
 )
 
 type PartitionsConfig struct {
-	Matcher string `yaml:"matcher"` // matcher should be a valid regular expression
+	Matcher        string `yaml:"matcher"`          // matcher should be a valid regular expression
 	DomainOverride string `yaml:"domain,omitempty"` // optional override for the domain
 
 	matcher *regexp.Regexp // compiled matcher if the config is valid
@@ -268,10 +268,11 @@ func (nbc *NetBWConfig) validate() error {
 }
 
 type Config struct {
-	DeviceDomain     string             `yaml:"domain"`
-	Partitions       []PartitionsConfig `yaml:"partitions"`
-	HostDevs         []HostDevConfig    `yaml:"hostdevs"`
-	NetworkBandwidth []NetBWConfig      `yaml:"networkBandwidth"`
+	DeviceDomain         string             `yaml:"domain"`
+	DisableTopologyHints bool               `yaml:"disable_topology_hints"`
+	Partitions           []PartitionsConfig `yaml:"partitions"`
+	HostDevs             []HostDevConfig    `yaml:"hostdevs"`
+	NetworkBandwidth     []NetBWConfig      `yaml:"networkBandwidth"`
 }
 
 func (c *Config) validate() error {

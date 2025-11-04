@@ -70,7 +70,7 @@ func (s *Scatter[T]) added(dev udev.Device) {
 	res := &resource{
 		resourceTemplate: *template,
 		instances:        make(map[Id]Instance),
-		healthCh:        make(chan HealthEvent),
+		healthCh:         make(chan HealthEvent),
 	}
 
 	for _, instance := range instances {

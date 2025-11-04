@@ -25,14 +25,14 @@ const (
 	PropertyPartName    = "PARTNAME"
 	PropertyModel       = "ID_MODEL"
 	PropertyShortSerial = "ID_SERIAL_SHORT"
-	
+
 	PropertyInterface = "INTERFACE"
 
 	SysAttrWWID   = "wwid"
 	SysAttrModel  = "model"
 	SysAttrSerial = "serial"
 
-	SysAttrSpeed = "speed"
+	SysAttrSpeed     = "speed"
 	SysAttrOperstate = "operstate"
 
 	ActionAdd     = "add"
