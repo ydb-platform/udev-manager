@@ -14,8 +14,8 @@ import (
 
 type networkBandwidth struct {
 	ifname string
-	idx   int
-	dev   udev.Device
+	idx    int
+	dev    udev.Device
 }
 
 func (n *networkBandwidth) Id() Id {
@@ -59,9 +59,9 @@ func NetBWMatcherTemplater(domain string, matcher *regexp.Regexp) FromDevice[*Re
 
 		return &ResourceTemplate{
 			Domain: domain,
-			Prefix:   fmt.Sprintf("netbw-%s", ifname),
+			Prefix: fmt.Sprintf("netbw-%s", ifname),
 		}, nil
-	} 
+	}
 }
 
 func NetBWMatcherInstances(domain string, matcher *regexp.Regexp, mbpsPerShare uint) FromDevice[[]*networkBandwidth] {

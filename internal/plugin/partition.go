@@ -15,9 +15,10 @@ import (
 
 // Partition represents a partition of a disk as a Resource.
 type partition struct {
-	domain string
-	label  string
-	dev    udev.Device
+	domain               string
+	label                string
+	dev                  udev.Device
+	disableTopologyHints bool
 }
 
 func (p *partition) Id() Id {
@@ -29,6 +30,9 @@ func (p *partition) Health() Health {
 }
 
 func (p *partition) TopologyHints() *pluginapi.TopologyInfo {
+	if p.disableTopologyHints {
+		return nil
+	}
 	numaNode := p.dev.NumaNode()
 	if numaNode < 0 {
 		return nil
@@ -112,7 +116,7 @@ func PartitionLabelMatcherTemplater(domain string, matcher *regexp.Regexp) FromD
 	}
 }
 
-func PartitionLabelMatcherInstances(domain string, matcher *regexp.Regexp) FromDevice[[]*partition] {
+func PartitionLabelMatcherInstances(domain string, matcher *regexp.Regexp, disableTopologyHints bool) FromDevice[[]*partition] {
 	return func(dev udev.Device) ([]*partition, error) {
 		var part *partition
 		if dev.Subsystem() != udev.BlockSubsystem {
@@ -137,9 +141,10 @@ func PartitionLabelMatcherInstances(domain string, matcher *regexp.Regexp) FromD
 		}
 
 		part = &partition{
-			label:  partlabel,
-			domain: domain,
-			dev:    dev,
+			label:                partlabel,
+			domain:               domain,
+			dev:                  dev,
+			disableTopologyHints: disableTopologyHints,
 		}
 
 		return []*partition{part}, nil

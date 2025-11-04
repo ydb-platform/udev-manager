@@ -84,8 +84,8 @@ type ResourceTemplate struct {
 
 type resource struct {
 	resourceTemplate ResourceTemplate
-	instances map[Id]Instance
-	healthCh   chan HealthEvent
+	instances        map[Id]Instance
+	healthCh         chan HealthEvent
 }
 
 func (r *resource) Name() string {

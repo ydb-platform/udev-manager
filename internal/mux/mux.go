@@ -61,7 +61,7 @@ type Sink[T any] interface {
 }
 
 type thenSink[U, T any] struct {
-	sink Sink[T]
+	sink      Sink[T]
 	contramap func(U) T
 }
 
@@ -79,7 +79,7 @@ func ThenSink[U, T any](sink Sink[T], f func(U) T) Sink[U] {
 
 type filterSink[T any] struct {
 	sink Sink[T]
-	f func(T) bool
+	f    func(T) bool
 }
 
 func (c *filterSink[T]) Submit(v T) error {
@@ -119,14 +119,14 @@ type Source[T any] interface {
 }
 
 type Mux[T any] struct {
-	input chan T
-	register chan AwaitDone[Sink[T]]
+	input      chan T
+	register   chan AwaitDone[Sink[T]]
 	unregister chan AwaitDone[Sink[T]]
-	outputs map[Sink[T]]bool
+	outputs    map[Sink[T]]bool
 
 	submitTimeout time.Duration
-	inBufSize int
-	logger Logger
+	inBufSize     int
+	logger        Logger
 }
 
 type Option[T any] interface {
@@ -187,7 +187,7 @@ func (c *Mux[T]) run() {
 		}
 	}()
 	defer close(c.input)
-	
+
 	for {
 		select {
 		case v := <-c.input:
@@ -221,7 +221,6 @@ func (m *Mux[T]) error(format string, args ...any) error {
 func (c *Mux[T]) Close() {
 	close(c.register)
 }
-
 
 func (c *Mux[T]) Submit(v T) error {
 	select {

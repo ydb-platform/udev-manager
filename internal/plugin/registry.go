@@ -20,7 +20,7 @@ import (
 // It is responsible for (re-)registering plugins with the kubelet.
 type Registry struct {
 	plugins sync.Map
-	ctx    	context.Context
+	ctx     context.Context
 	wg      *sync.WaitGroup
 	watcher *fsnotify.Watcher
 }
@@ -105,7 +105,7 @@ func NewRegistry(ctx context.Context, wg *sync.WaitGroup) (*Registry, error) {
 		for {
 			select {
 			case event := <-r.watcher.Events:
-				if event.Op & fsnotify.Create != 0 {
+				if event.Op&fsnotify.Create != 0 {
 					r.hup()
 				}
 			case <-r.ctx.Done():
@@ -113,7 +113,7 @@ func NewRegistry(ctx context.Context, wg *sync.WaitGroup) (*Registry, error) {
 				return
 			}
 		}
-	}(registry)	
+	}(registry)
 
 	return registry, nil
 }
@@ -162,5 +162,3 @@ func (r *Registry) Add(resource Resource) error {
 	}
 	return nil
 }
-
-

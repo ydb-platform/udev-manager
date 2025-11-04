@@ -86,8 +86,8 @@ func (p *plugin) ListAndWatch(empty *pluginapi.Empty, stream pluginapi.DevicePlu
 		devices := make([]*pluginapi.Device, len(instances))
 		for i, instance := range instances {
 			devices[i] = &pluginapi.Device{
-				ID:     string(instance.Id()),
-				Health: instance.Health().String(),
+				ID:       string(instance.Id()),
+				Health:   instance.Health().String(),
 				Topology: instance.TopologyHints(),
 			}
 		}
@@ -162,13 +162,13 @@ func (p *plugin) socketPath() string {
 }
 
 func (p *plugin) probe(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 1 * time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
 	pluginAddr := "unix://" + pluginapi.DevicePluginPath + p.socketPath()
 
 	conn, err := grpc.DialContext(
-		ctx, 
+		ctx,
 		pluginAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
