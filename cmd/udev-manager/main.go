@@ -77,6 +77,18 @@ func main() {
 		)
 	}
 
+	for _, netRdmaConfig := range flags.config.NetworkRdma {
+		cancel = mux.ChainCancelFunc(
+			plugin.NewScatter(
+				devDiscovery,
+				registry,
+				plugin.NetRdmaMatcherTemplater(domain, netRdmaConfig.matcher),
+				plugin.NetRdmaMatcherInstances(domain, netRdmaConfig.matcher, int(netRdmaConfig.ResourceNumber)),
+			),
+			cancel,
+		)
+	}
+
 	klog.Info("Starting /healthz server on port :8080")
 	go func() {
 		http.HandleFunc("/healthz", registry.Healthz)
@@ -267,12 +279,30 @@ func (nbc *NetBWConfig) validate() error {
 	return nil
 }
 
+type NetRdmaConfig struct {
+	Matcher        string `yaml:"matcher"` // matcher should be a valid regular expression
+	ResourceNumber uint   `yaml:"resourceNumber"`
+
+	matcher *regexp.Regexp // compiled matcher if the config is valid
+}
+
+func (nrc *NetRdmaConfig) validate() error {
+	// Compile the regular expression
+	matcher, err := regexp.Compile(nrc.Matcher)
+	if err != nil {
+		return fmt.Errorf(".matcher: %q must be a valid regexp: %w", nrc.Matcher, err)
+	}
+	nrc.matcher = matcher
+	return nil
+}
+
 type Config struct {
 	DeviceDomain         string             `yaml:"domain"`
 	DisableTopologyHints bool               `yaml:"disable_topology_hints"`
 	Partitions           []PartitionsConfig `yaml:"partitions"`
 	HostDevs             []HostDevConfig    `yaml:"hostdevs"`
 	NetworkBandwidth     []NetBWConfig      `yaml:"networkBandwidth"`
+	NetworkRdma          []NetRdmaConfig    `yaml:"networkRdma"`
 }
 
 func (c *Config) validate() error {
@@ -303,6 +333,13 @@ func (c *Config) validate() error {
 	for i := range c.NetworkBandwidth {
 		if err := c.NetworkBandwidth[i].validate(); err != nil {
 			errs = errors.Join(errs, fmt.Errorf(".networkBandwidth[%d]%w", i, err))
+		}
+	}
+
+	// Validate network rdma
+	for i := range c.NetworkRdma {
+		if err := c.NetworkRdma[i].validate(); err != nil {
+			errs = errors.Join(errs, fmt.Errorf(".networkRdma[%d]%w", i, err))
 		}
 	}
 
