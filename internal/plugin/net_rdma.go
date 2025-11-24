@@ -87,7 +87,6 @@ func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesNum
 		if ifname == "" {
 			return nil, nil
 		}
-		klog.Info("found interface: ", ifname)
 
 		if !matcher.MatchString(ifname) {
 			return nil, nil
@@ -99,8 +98,7 @@ func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesNum
 			return nil, nil
 		}
 		rdmaCharDevices := rdmamap.GetRdmaCharDevices(rdmaDevice)
-
-		klog.Info("found rdma devices: ", ifname, rdmaCharDevices)
+		klog.Info("found rdma character devices for ifname: %s devices: %v", ifname, rdmaCharDevices)
 
 		instances := make([]*netRdma, 0, resourcesNumber)
 		for i := 0; i < resourcesNumber; i++ {
