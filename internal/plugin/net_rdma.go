@@ -14,11 +14,11 @@ import (
 )
 
 type netRdma struct {
-	domain      string
-	ifname      string
-	idx         int
-	dev         udev.Device
-	rdmaDevices []string
+	domain            string
+	ifname            string
+	idx               int
+	dev               udev.Device
+	associatedDevices []string
 }
 
 func (n *netRdma) Id() Id {
@@ -39,7 +39,7 @@ func (n *netRdma) TopologyHints() *pluginapi.TopologyInfo {
 func (n *netRdma) Allocate(context.Context) (*pluginapi.ContainerAllocateResponse, error) {
 	response := &pluginapi.ContainerAllocateResponse{}
 
-	for _, dev := range n.rdmaDevices {
+	for _, dev := range n.associatedDevices {
 		response.Devices = append(response.Devices, &pluginapi.DeviceSpec{
 			HostPath:      dev,
 			ContainerPath: dev,
@@ -77,7 +77,7 @@ func NetRdmaMatcherTemplater(domain string, matcher *regexp.Regexp) FromDevice[*
 	}
 }
 
-func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesNumber int) FromDevice[[]*netRdma] {
+func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesCount int) FromDevice[[]*netRdma] {
 	return func(dev udev.Device) ([]*netRdma, error) {
 		if dev.Subsystem() != udev.NetSubsystem {
 			return nil, nil
@@ -100,14 +100,14 @@ func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesNum
 		rdmaCharDevices := rdmamap.GetRdmaCharDevices(rdmaDevice)
 		klog.Info("found rdma character devices for ifname: %s devices: %v", ifname, rdmaCharDevices)
 
-		instances := make([]*netRdma, 0, resourcesNumber)
-		for i := 0; i < resourcesNumber; i++ {
+		instances := make([]*netRdma, 0, resourcesCount)
+		for i := 0; i < resourcesCount; i++ {
 			instances = append(instances, &netRdma{
-				domain:      domain,
-				ifname:      ifname,
-				idx:         i,
-				dev:         dev,
-				rdmaDevices: rdmaCharDevices,
+				domain:            domain,
+				ifname:            ifname,
+				idx:               i,
+				dev:               dev,
+				associatedDevices: rdmaCharDevices,
 			})
 		}
 

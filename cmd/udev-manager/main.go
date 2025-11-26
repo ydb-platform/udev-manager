@@ -83,7 +83,7 @@ func main() {
 				devDiscovery,
 				registry,
 				plugin.NetRdmaMatcherTemplater(domain, netRdmaConfig.matcher),
-				plugin.NetRdmaMatcherInstances(domain, netRdmaConfig.matcher, int(netRdmaConfig.ResourceNumber)),
+				plugin.NetRdmaMatcherInstances(domain, netRdmaConfig.matcher, int(netRdmaConfig.ResourceCount)),
 			),
 			cancel,
 		)
@@ -280,8 +280,8 @@ func (nbc *NetBWConfig) validate() error {
 }
 
 type NetRdmaConfig struct {
-	Matcher        string `yaml:"matcher"` // matcher should be a valid regular expression
-	ResourceNumber uint   `yaml:"resourceNumber"`
+	Matcher       string `yaml:"matcher"` // matcher should be a valid regular expression
+	ResourceCount uint   `yaml:"resourceCount"`
 
 	matcher *regexp.Regexp // compiled matcher if the config is valid
 }
