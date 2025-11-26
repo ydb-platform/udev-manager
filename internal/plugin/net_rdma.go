@@ -98,7 +98,7 @@ func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesCou
 			return nil, nil
 		}
 		rdmaCharDevices := rdmamap.GetRdmaCharDevices(rdmaDevice)
-		klog.Info("found rdma character devices for ifname: %s devices: %v", ifname, rdmaCharDevices)
+		klog.Infof("found rdma character devices for ifname: %s devices: %v", ifname, rdmaCharDevices)
 
 		instances := make([]*netRdma, 0, resourcesCount)
 		for i := 0; i < resourcesCount; i++ {
