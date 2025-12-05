@@ -23,6 +23,8 @@ import (
 	"github.com/ydb-platform/udev-manager/internal/udev"
 )
 
+const DEFAULT_HEALTHCHECK_PORT = 8080
+
 func main() {
 	appContext, appCancel := context.WithCancel(context.Background())
 	appWaitGroup := &sync.WaitGroup{}
@@ -89,10 +91,11 @@ func main() {
 		)
 	}
 
-	klog.Info("Starting /healthz server on port :8080")
+	healthCheckAddr := fmt.Sprintf(":%d", flags.config.HealthCheckPort)
+	klog.Infof("Starting /healthz server on port %s", healthCheckAddr)
 	go func() {
 		http.HandleFunc("/healthz", registry.Healthz)
-		if err := http.ListenAndServe(":8080", nil); err != nil {
+		if err := http.ListenAndServe(healthCheckAddr, nil); err != nil {
 			klog.Fatalf("failed to start /healthz server: %v", err)
 		}
 	}()
@@ -299,6 +302,7 @@ func (nrc *NetRdmaConfig) validate() error {
 type Config struct {
 	DeviceDomain         string             `yaml:"domain"`
 	DisableTopologyHints bool               `yaml:"disable_topology_hints"`
+	HealthCheckPort      uint16             `yaml:"health_check_port"`
 	Partitions           []PartitionsConfig `yaml:"partitions"`
 	HostDevs             []HostDevConfig    `yaml:"hostdevs"`
 	NetworkBandwidth     []NetBWConfig      `yaml:"networkBandwidth"`
@@ -313,6 +317,9 @@ func (c *Config) validate() error {
 	}
 	if !deviceDomainRegex.MatchString(c.DeviceDomain) {
 		errs = errors.Join(errs, fmt.Errorf(".domain: %q must be a valid domain name", c.DeviceDomain))
+	}
+	if c.HealthCheckPort == 0 {
+		c.HealthCheckPort = DEFAULT_HEALTHCHECK_PORT
 	}
 
 	// Validate partitions
