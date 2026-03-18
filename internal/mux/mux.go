@@ -273,27 +273,36 @@ func (c *Mux[T]) run() {
 		// each in-flight Submit will either complete its send to c.input
 		// or bail via <-c.done, then release its RLock. Once we acquire
 		// the full Lock, no new values can enter the buffer.
+		//
+		// Drain buffered values into a local slice under the lock, then
+		// release it before delivering to sinks. This prevents a slow
+		// sink from holding submitMu indefinitely during shutdown.
+		var buffered []T
 		c.submitMu.Lock()
-		defer c.submitMu.Unlock()
-
-		// Drain any buffered values so that a successful Submit is never
-		// silently lost.
 		for {
 			select {
 			case v := <-c.input:
-				for out := range c.outputs {
-					if err := out.Submit(v); err != nil {
-						_ = c.error("error submitting value %v: %v", v, err)
-					}
-				}
+				buffered = append(buffered, v)
 			default:
-				// Buffer empty — close all sinks.
-				for sub := range c.outputs {
-					delete(c.outputs, sub)
-					sub.Close()
-				}
-				return
+				goto drained
 			}
+		}
+	drained:
+		c.submitMu.Unlock()
+
+		// Deliver buffered values to sinks outside the lock.
+		for _, v := range buffered {
+			for out := range c.outputs {
+				if err := out.Submit(v); err != nil {
+					_ = c.error("error submitting value %v: %v", v, err)
+				}
+			}
+		}
+
+		// Close all sinks.
+		for sub := range c.outputs {
+			delete(c.outputs, sub)
+			sub.Close()
 		}
 	}()
 
