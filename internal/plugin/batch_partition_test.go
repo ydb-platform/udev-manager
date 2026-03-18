@@ -201,6 +201,22 @@ var _ = Describe("batchPartitionSeat", func() {
 	})
 })
 
+var _ = Describe("newResource Close", func() {
+	It("stops the run goroutine and closes instanceCh", func() {
+		// Simulates what happens when registry.Add fails and res.Close() is called:
+		// the eagerly-started goroutine must exit cleanly.
+		res := newResource(
+			ResourceTemplate{Domain: "ydb.tech", Prefix: "batch-test"},
+			map[Id]Instance{},
+		)
+		ch := res.ListAndWatch(context.Background())
+		Eventually(ch).Should(Receive()) // drain initial snapshot
+
+		res.Close()
+		Eventually(ch).Should(BeClosed())
+	})
+})
+
 var _ = Describe("runBatchPartitionScatter", func() {
 	var (
 		pool    *batchPartitionPool

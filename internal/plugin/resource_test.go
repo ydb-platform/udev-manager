@@ -7,6 +7,18 @@ import (
 	. "github.com/onsi/gomega"
 )
 
+var _ = Describe("resource cleanup", func() {
+	It("closes the instance channel when Close is called before any ListAndWatch", func() {
+		r := newResource(
+			ResourceTemplate{Domain: "ydb.tech", Prefix: "part-disk01"},
+			make(map[Id]Instance),
+		)
+		r.Close()
+		// The run goroutine should exit and close instanceCh.
+		Eventually(r.ListAndWatch(context.Background())).Should(BeClosed())
+	})
+})
+
 var _ = Describe("resource", func() {
 	Describe("Name", func() {
 		It("returns domain/prefix", func() {

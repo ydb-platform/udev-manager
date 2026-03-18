@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/ydb-platform/udev-manager/internal/mux"
 
@@ -47,6 +48,36 @@ func (s *collectSink[T]) Closed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closed
+}
+
+// slowSink is a Sink that sleeps on each Submit, simulating a slow consumer.
+type slowSink[T any] struct {
+	mu     sync.Mutex
+	values []T
+	closed bool
+	delay  time.Duration
+}
+
+func (s *slowSink[T]) Submit(v T) error {
+	time.Sleep(s.delay)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.values = append(s.values, v)
+	return nil
+}
+
+func (s *slowSink[T]) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+}
+
+func (s *slowSink[T]) Values() []T {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]T, len(s.values))
+	copy(out, s.values)
+	return out
 }
 
 // errSink is a Sink whose Submit always returns a fixed error.
@@ -390,6 +421,57 @@ var _ = Describe("Mux Close", func() {
 
 		Eventually(s1.Closed).Should(BeTrue())
 		Eventually(s2.Closed).Should(BeTrue())
+	})
+
+	It("is idempotent and does not panic on double close", func() {
+		m := mux.Make[int]()
+		sink := &collectSink[int]{}
+		m.Subscribe(sink)
+
+		m.Close()
+		Expect(func() { m.Close() }).NotTo(Panic())
+		Eventually(sink.Closed).Should(BeTrue())
+	})
+
+	It("completes shutdown even when a sink is slow", func() {
+		m := mux.Make[int](mux.Buffered[int](4))
+		slow := &slowSink[int]{delay: 50 * time.Millisecond}
+		m.Subscribe(slow)
+
+		// Fill the buffer with a few values.
+		for i := 0; i < 3; i++ {
+			_ = m.Submit(i)
+		}
+
+		// Wait for all values to be delivered before closing.
+		Eventually(func() int { return len(slow.Values()) }, "2s").Should(Equal(3))
+
+		// Close should complete in a bounded time despite the slow sink.
+		done := make(chan struct{})
+		go func() {
+			m.Close()
+			close(done)
+		}()
+		Eventually(done, "2s").Should(BeClosed())
+	})
+
+	It("drains buffered values to sinks before closing them", func() {
+		m := mux.Make[int](mux.Buffered[int](8))
+		sink := &collectSink[int]{}
+		m.Subscribe(sink)
+
+		// Submit several values.
+		for i := 0; i < 5; i++ {
+			_ = m.Submit(i)
+		}
+		// Give the mux goroutine time to deliver some.
+		time.Sleep(20 * time.Millisecond)
+
+		m.Close()
+
+		// All 5 values must have been delivered.
+		Eventually(sink.Closed).Should(BeTrue())
+		Expect(sink.Values()).To(HaveLen(5))
 	})
 })
 
