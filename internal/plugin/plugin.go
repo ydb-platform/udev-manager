@@ -22,6 +22,7 @@ import (
 type plugin struct {
 	resource Resource
 	cancel   context.CancelFunc
+	stopped  chan struct{} // closed after gRPC server is fully stopped
 }
 
 func newPlugin(resource Resource, ctx context.Context, wg *sync.WaitGroup) (*plugin, error) {
@@ -29,6 +30,7 @@ func newPlugin(resource Resource, ctx context.Context, wg *sync.WaitGroup) (*plu
 	plugin := &plugin{
 		resource: resource,
 		cancel:   cancel,
+		stopped:  make(chan struct{}),
 	}
 
 	socketPath := pluginapi.DevicePluginPath + plugin.socketPath()
@@ -53,8 +55,9 @@ func newPlugin(resource Resource, ctx context.Context, wg *sync.WaitGroup) (*plu
 	}()
 
 	wg.Add(1)
-	go func(ctx context.Context, wg *sync.WaitGroup, l net.Listener, s *grpc.Server) {
+	go func(ctx context.Context, wg *sync.WaitGroup, l net.Listener, s *grpc.Server, stopped chan struct{}) {
 		defer wg.Done()
+		defer close(stopped)
 		defer func() {
 			if err := l.Close(); err != nil {
 				klog.Errorf("failed to close listener: %v", err)
@@ -63,15 +66,18 @@ func newPlugin(resource Resource, ctx context.Context, wg *sync.WaitGroup) (*plu
 		defer s.Stop()
 		klog.Infof("Serving device plugin %q on socket %q", plugin.resource.Name(), socketPath)
 		<-ctx.Done()
-	}(ctx, wg, listener, server)
+	}(ctx, wg, listener, server, plugin.stopped)
 
 	return plugin, nil
 }
 
+// stop cancels the plugin's context and waits for the gRPC server to fully
+// shut down, ensuring no in-flight ListAndWatch handlers remain.
 func (p *plugin) stop() {
 	if p.cancel != nil {
 		klog.Infof("%q: Stopping device plugin", p.resource.Name())
 		p.cancel()
+		<-p.stopped
 	}
 }
 
@@ -90,22 +96,31 @@ func (p *plugin) PreStartContainer(context.Context, *pluginapi.PreStartContainer
 func (p *plugin) ListAndWatch(empty *pluginapi.Empty, stream pluginapi.DevicePlugin_ListAndWatchServer) (err error) {
 	defer klog.Infof("%q: closing ListAndWatch connection, err = %v", p.resource.Name(), err)
 
-	for instances := range p.resource.ListAndWatch(stream.Context()) {
-		devices := make([]*pluginapi.Device, len(instances))
-		for i, instance := range instances {
-			devices[i] = &pluginapi.Device{
-				ID:       string(instance.Id()),
-				Health:   instance.Health().String(),
-				Topology: instance.TopologyHints(),
+	ctx := stream.Context()
+	instanceCh := p.resource.ListAndWatch(ctx)
+	for {
+		select {
+		case instances, ok := <-instanceCh:
+			if !ok {
+				return nil
 			}
-		}
-		klog.V(2).Infof("%q: sending devices to ListAndWatch stream: %+v", p.resource.Name(), devices)
-		if err := stream.Send(&pluginapi.ListAndWatchResponse{Devices: devices}); err != nil {
-			klog.Errorf("%q: failed to send devices to ListAndWatch stream: %v", p.resource.Name(), err)
-			return err
+			devices := make([]*pluginapi.Device, len(instances))
+			for i, instance := range instances {
+				devices[i] = &pluginapi.Device{
+					ID:       string(instance.Id()),
+					Health:   instance.Health().String(),
+					Topology: instance.TopologyHints(),
+				}
+			}
+			klog.V(2).Infof("%q: sending devices to ListAndWatch stream: %+v", p.resource.Name(), devices)
+			if err := stream.Send(&pluginapi.ListAndWatchResponse{Devices: devices}); err != nil {
+				klog.Errorf("%q: failed to send devices to ListAndWatch stream: %v", p.resource.Name(), err)
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
-	return nil
 }
 
 func mergeResponses(responses ...*pluginapi.ContainerAllocateResponse) *pluginapi.ContainerAllocateResponse {

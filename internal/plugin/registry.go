@@ -65,16 +65,17 @@ func (r *Registry) register(plugin *plugin) error {
 // Newely started kubelet removes all socket files, so we need to re-register
 // all plugins. See https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#handling-kubelet-restarts
 func (r *Registry) hup() {
-	r.plugins.Range(func(_, p interface{}) bool {
-		plugin := p.(*plugin)
-		plugin.stop()
-		plugin, err := newPlugin(plugin.resource, r.ctx, r.wg)
+	r.plugins.Range(func(key, p interface{}) bool {
+		old := p.(*plugin)
+		old.stop()
+		newP, err := newPlugin(old.resource, r.ctx, r.wg)
 		if err != nil {
-			klog.Errorf("failed to create plugin for %s: %v", plugin.resource.Name(), err)
+			klog.Errorf("failed to create plugin for %s: %v", old.resource.Name(), err)
 			return true
 		}
-		if err := r.register(plugin); err != nil {
-			klog.Errorf("failed to register %s: %v", plugin.resource.Name(), err)
+		r.plugins.Store(key, newP)
+		if err := r.register(newP); err != nil {
+			klog.Errorf("failed to register %s: %v", newP.resource.Name(), err)
 		}
 		return true
 	})

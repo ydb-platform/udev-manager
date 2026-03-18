@@ -175,16 +175,18 @@ func (f *FakeDiscovery) AddDevice(dev Device) {
 }
 
 // Emit pushes ev to all current subscribers and updates the internal state:
-// Added events add the device, Removed events delete it.
+// Added events add the device, Removed events delete it. The state update and
+// event delivery are performed atomically under the lock to prevent races with
+// concurrent Subscribe calls.
 func (f *FakeDiscovery) Emit(ev Event) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	switch e := ev.(type) {
 	case Added:
 		f.state[e.Id()] = e.Device
 	case Removed:
 		delete(f.state, e.Id())
 	}
-	f.mu.Unlock()
 	_ = f.m.Submit(ev)
 }
 

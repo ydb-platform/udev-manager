@@ -198,10 +198,16 @@ type Mux[T any] struct {
 	// outputs is the live set of registered sinks, owned exclusively by run.
 	outputs map[Sink[T]]bool
 
-	// done is closed by run() on exit, signalling that the mux is shut down.
-	// Submit, Subscribe, and CancelFunc select on it to avoid panics.
+	// done is closed by Close() to signal shutdown. run(), Submit, Subscribe,
+	// and CancelFunc all select on it to stop cleanly.
 	done     chan struct{}
 	doneOnce sync.Once
+
+	// submitMu guards the window between Submit's done-check and its channel
+	// send. Submit holds RLock (concurrent submits allowed); the drain defer
+	// in run() takes Lock to ensure all in-flight Submits have completed
+	// before draining the buffer.
+	submitMu sync.RWMutex
 
 	// submitTimeout is how long Submit waits before giving up.
 	submitTimeout time.Duration
@@ -259,19 +265,35 @@ func Make[T any](opts ...Option[T]) *Mux[T] {
 // without any mutex, and delivery order is well-defined.
 //
 // Lifecycle:
-//   - Runs until Close is called, which closes the register channel.
-//   - On exit, closes every remaining sink and signals done.
+//   - Runs until Close is called, which closes the done channel.
+//   - On exit, closes every remaining sink.
 func (c *Mux[T]) run() {
 	defer func() {
-		// Signal that the mux is shut down. Submit/Subscribe/CancelFunc
-		// select on this to avoid panics on closed channels.
-		c.doneOnce.Do(func() { close(c.done) })
-	}()
-	defer func() {
-		// Close all registered sinks so downstream goroutines can terminate.
-		for sub := range c.outputs {
-			delete(c.outputs, sub)
-			sub.Close()
+		// Wait for all in-flight Submits to finish. After done is closed,
+		// each in-flight Submit will either complete its send to c.input
+		// or bail via <-c.done, then release its RLock. Once we acquire
+		// the full Lock, no new values can enter the buffer.
+		c.submitMu.Lock()
+		defer c.submitMu.Unlock()
+
+		// Drain any buffered values so that a successful Submit is never
+		// silently lost.
+		for {
+			select {
+			case v := <-c.input:
+				for out := range c.outputs {
+					if err := out.Submit(v); err != nil {
+						_ = c.error("error submitting value %v: %v", v, err)
+					}
+				}
+			default:
+				// Buffer empty — close all sinks.
+				for sub := range c.outputs {
+					delete(c.outputs, sub)
+					sub.Close()
+				}
+				return
+			}
 		}
 	}()
 
@@ -287,11 +309,7 @@ func (c *Mux[T]) run() {
 				}
 			}
 
-		case ar, ok := <-c.register:
-			// A closed register channel is the shutdown signal from Close().
-			if !ok {
-				return
-			}
+		case ar := <-c.register:
 			c.outputs[ar.value] = true
 			// Unblock the caller of Subscribe.
 			ar.reply <- struct{}{}
@@ -302,6 +320,9 @@ func (c *Mux[T]) run() {
 			sub.Close()
 			// Unblock the caller of the CancelFunc returned by Subscribe.
 			ar.reply <- struct{}{}
+
+		case <-c.done:
+			return
 		}
 	}
 }
@@ -317,11 +338,9 @@ func (m *Mux[T]) error(format string, args ...any) error {
 
 // Close shuts down the Mux. It closes every registered sink and causes the
 // internal goroutine to exit. After Close returns, Submit will time out rather
-// than block indefinitely.
-//
-// Close must be called at most once.
+// than block indefinitely. Close is idempotent.
 func (c *Mux[T]) Close() {
-	close(c.register)
+	c.doneOnce.Do(func() { close(c.done) })
 }
 
 // Submit enqueues v for delivery to all registered sinks. It blocks until the
@@ -332,9 +351,10 @@ func (c *Mux[T]) Close() {
 // that case. This prevents a slow or blocked sink from stalling the producer
 // indefinitely when a [Buffered] input channel is also full.
 func (c *Mux[T]) Submit(v T) error {
+	c.submitMu.RLock()
+	defer c.submitMu.RUnlock()
+
 	// Fast path: if the mux is already shut down, fail immediately.
-	// This prevents values from being enqueued into a buffered input
-	// channel after run() has exited (where they would never be delivered).
 	select {
 	case <-c.done:
 		return c.error("mux is closed, cannot submit value %v", v)
