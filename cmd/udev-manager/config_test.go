@@ -134,6 +134,57 @@ var _ = Describe("partitionsConfig.validate", func() {
 	})
 })
 
+var _ = Describe("batchPartitionsConfig.validate", func() {
+	It("accepts a minimal valid batch config", func() {
+		bc := &batchPartitionsConfig{Name: "nvme-set", Matcher: `nvme.*`}
+		Expect(bc.validate()).NotTo(HaveOccurred())
+		Expect(bc.matcher).NotTo(BeNil())
+	})
+
+	It("rejects an empty name", func() {
+		bc := &batchPartitionsConfig{Name: "", Matcher: `nvme.*`}
+		Expect(bc.validate()).To(MatchError(ContainSubstring(".name")))
+	})
+
+	It("rejects an invalid regexp", func() {
+		bc := &batchPartitionsConfig{Name: "test", Matcher: `[`}
+		Expect(bc.validate()).To(MatchError(ContainSubstring(".matcher")))
+	})
+
+	It("defaults count to 1 when not set", func() {
+		bc := &batchPartitionsConfig{Name: "nvme-set", Matcher: `nvme.*`}
+		Expect(bc.validate()).NotTo(HaveOccurred())
+		Expect(bc.Count).To(Equal(1))
+	})
+
+	It("preserves an explicit count", func() {
+		bc := &batchPartitionsConfig{Name: "nvme-set", Matcher: `nvme.*`, Count: 3}
+		Expect(bc.validate()).NotTo(HaveOccurred())
+		Expect(bc.Count).To(Equal(3))
+	})
+
+	It("accepts a valid domain override", func() {
+		bc := &batchPartitionsConfig{Name: "nvme-set", Matcher: `nvme.*`, DomainOverride: "storage.example.com"}
+		Expect(bc.validate()).NotTo(HaveOccurred())
+	})
+
+	It("rejects an invalid domain override", func() {
+		bc := &batchPartitionsConfig{Name: "nvme-set", Matcher: `nvme.*`, DomainOverride: "bad domain"}
+		Expect(bc.validate()).To(MatchError(ContainSubstring(".domain")))
+	})
+
+	It("allows multiple capture groups (unlike partitionsConfig)", func() {
+		bc := &batchPartitionsConfig{Name: "nvme-set", Matcher: `nvme_(.*)_(.*)`}
+		Expect(bc.validate()).NotTo(HaveOccurred())
+	})
+
+	It("compiles matcher so it can be used after validate", func() {
+		bc := &batchPartitionsConfig{Name: "nvme-set", Matcher: `nvme_data_\d+`}
+		Expect(bc.validate()).NotTo(HaveOccurred())
+		Expect(bc.matcher.MatchString("nvme_data_01")).To(BeTrue())
+		Expect(bc.matcher.MatchString("sda1")).To(BeFalse())
+	})
+})
 
 var _ = Describe("netBWConfig.validate", func() {
 	It("accepts a valid matcher", func() {
@@ -196,6 +247,22 @@ partitions:
 		Expect(cfg.Partitions[1].DomainOverride).To(Equal("storage.example.com"))
 	})
 
+	It("parses batchPartitions section", func() {
+		cfg := mustParseYAML(`
+domain: ydb.tech
+batchPartitions:
+  - name: nvme-set
+    matcher: "nvme_data_.*"
+    count: 2
+  - name: ssd-stripe
+    matcher: "ssd_stripe_.*"
+`)
+		Expect(cfg.BatchPartitions).To(HaveLen(2))
+		Expect(cfg.BatchPartitions[0].Name).To(Equal("nvme-set"))
+		Expect(cfg.BatchPartitions[0].Count).To(Equal(2))
+		Expect(cfg.BatchPartitions[0].matcher).NotTo(BeNil())
+		Expect(cfg.BatchPartitions[1].Count).To(Equal(1)) // defaulted
+	})
 
 	It("parses networkBandwidth section", func() {
 		cfg := mustParseYAML(`
@@ -226,6 +293,9 @@ networkRdma:
 domain: ydb.tech
 partitions:
   - matcher: "["
+batchPartitions:
+  - name: ""
+    matcher: "nvme.*"
 networkBandwidth:
   - matcher: "["
 networkRdma:
@@ -233,6 +303,7 @@ networkRdma:
 `)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring(".partitions[0]"))
+		Expect(err.Error()).To(ContainSubstring(".batchPartitions[0]"))
 		Expect(err.Error()).To(ContainSubstring(".networkBandwidth[0]"))
 		Expect(err.Error()).To(ContainSubstring(".networkRdma[0]"))
 	})
