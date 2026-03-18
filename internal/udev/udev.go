@@ -66,8 +66,9 @@ func (n newSub) requestSealed() {}
 type generic struct {
 	udev Discovery
 
-	dev    *libudev.Device
-	parent Device
+	dev        *libudev.Device
+	parentOnce sync.Once
+	parent     Device
 }
 
 func (g *generic) Id() Id {
@@ -75,9 +76,11 @@ func (g *generic) Id() Id {
 }
 
 func (g *generic) Parent() Device {
-	if g.parent == nil {
-		g.parent = g.udev.DeviceById(Id(g.dev.Syspath()))
-	}
+	g.parentOnce.Do(func() {
+		if g.parent == nil {
+			g.parent = g.udev.DeviceById(Id(g.dev.Syspath()))
+		}
+	})
 	return g.parent
 }
 
@@ -112,10 +115,11 @@ func (g *generic) Property(key string) string {
 
 func (g *generic) PropertyLookup(key string) string {
 	value := g.Property(key)
-	if value == "" && g.parent != nil {
-		return g.parent.PropertyLookup(key)
+	if value == "" {
+		if p := g.Parent(); p != nil {
+			return p.PropertyLookup(key)
+		}
 	}
-
 	return value
 }
 
@@ -142,10 +146,11 @@ func (g *generic) SystemAttributes() map[string]string {
 
 func (g *generic) SystemAttributeLookup(key string) string {
 	value := g.SystemAttribute(key)
-	if value == "" && g.parent != nil {
-		return g.parent.SystemAttributeLookup(key)
+	if value == "" {
+		if p := g.Parent(); p != nil {
+			return p.SystemAttributeLookup(key)
+		}
 	}
-
 	return value
 }
 
@@ -221,10 +226,12 @@ func (s *udevSlice) Subscribe(sink mux.Sink[[]Device]) mux.CancelFunc {
 
 type udevDiscovery struct {
 	udev     libudev.Udev
-	state    map[Id]Device // should be accessed only by monitor goroutine
+	mu       sync.RWMutex
+	state    map[Id]Device
 	requests chan mux.AwaitReply[monitorRequest, any]
 	mux      *mux.Mux[Event]
 	wg       *sync.WaitGroup
+	done     chan struct{} // closed when monitor exits
 }
 
 // NewDiscovery creates a real udev-backed Discovery. It enumerates all
@@ -236,6 +243,7 @@ func NewDiscovery(wg *sync.WaitGroup) (Discovery, error) {
 		requests: make(chan mux.AwaitReply[monitorRequest, any]),
 		mux:      mux.Make[Event](),
 		wg:       wg,
+		done:     make(chan struct{}),
 	}
 	enum := d.udev.NewEnumerate()
 
@@ -269,19 +277,28 @@ func NewDiscovery(wg *sync.WaitGroup) (Discovery, error) {
 
 func (d *udevDiscovery) Close() {
 	await := mux.NewAwaitReply[monitorRequest, any](stopRequest{})
-	defer await.Await()
-	d.requests <- await
+	select {
+	case d.requests <- await:
+		await.Await()
+	case <-d.done:
+	}
 }
 
 // State returns the current state of the devices as seen by the monitor
 func (d *udevDiscovery) State(filter mux.FilterFunc[Device]) map[Id]Device {
 	await := mux.NewAwaitReply[monitorRequest, any](stateRequest{filter: filter})
-	d.requests <- await
-	return await.Await().(map[Id]Device)
+	select {
+	case d.requests <- await:
+		return await.Await().(map[Id]Device)
+	case <-d.done:
+		return nil
+	}
 }
 
 func (d *udevDiscovery) DeviceById(id Id) Device {
-	return d.state[id] // read-only access should be safe. worst case it would return stale data
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.state[id]
 }
 
 func (d *udevDiscovery) Slice(filter mux.FilterFunc[Device]) Slice {
@@ -384,7 +401,7 @@ func sliceSnapshot(state map[Id]Device) []Device {
 func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer d.mux.Close()
-	defer close(d.requests)
+	defer close(d.done)
 
 	mon := d.udev.NewMonitorFromNetlink("udev")
 	devChan, errChan, err := mon.DeviceChan(context.Background())
@@ -404,14 +421,18 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 					udev: d,
 					dev:  dev,
 				}
+				d.mu.Lock()
 				d.state[id] = dev
+				d.mu.Unlock()
 				if err := d.mux.Submit(Added{dev}); err != nil {
 					klog.Errorf("udev: failed to submit Added event: %v", err)
 				}
 			case ActionRemove, ActionOffline:
 				id := Id(dev.Syspath())
+				d.mu.Lock()
 				dev := d.state[id]
 				delete(d.state, id)
+				d.mu.Unlock()
 				if err := d.mux.Submit(Removed{dev}); err != nil {
 					klog.Errorf("udev: failed to submit Removed event: %v", err)
 				}
@@ -419,18 +440,22 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 		case req := <-d.requests:
 			switch r := req.Value().(type) {
 			case stateRequest:
+				d.mu.RLock()
 				state := make(map[Id]Device)
 				for k, v := range d.state {
 					if r.filter(v) {
 						state[k] = v
 					}
 				}
+				d.mu.RUnlock()
 				req.Reply(state)
 			case newSub:
+				d.mu.RLock()
 				init := make([]Device, 0, len(d.state))
 				for _, dev := range d.state {
 					init = append(init, dev)
 				}
+				d.mu.RUnlock()
 				err := r.sink.Submit(Init{init})
 				if err != nil {
 					klog.Errorf("Failed to submit init event: %v", err)
@@ -461,6 +486,10 @@ func (d *udevDiscovery) Subscribe(sink mux.Sink[Event]) mux.CancelFunc {
 	// to be able to pass consistent Init event to the sink
 	// before making fan out of udev events
 	await := mux.NewAwaitReply[monitorRequest, any](newSub{sink})
-	d.requests <- await
-	return await.Await().(mux.CancelFunc)
+	select {
+	case d.requests <- await:
+		return await.Await().(mux.CancelFunc)
+	case <-d.done:
+		return func() {}
+	}
 }

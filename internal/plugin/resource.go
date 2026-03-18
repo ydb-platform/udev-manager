@@ -166,11 +166,19 @@ func (r *resource) snapshot() []Instance {
 // never blocks waiting for ListAndWatch to be called.
 func (r *resource) run() {
 	defer close(r.instanceCh)
-	r.instanceCh <- r.snapshot()
+	select {
+	case r.instanceCh <- r.snapshot():
+	case <-r.done:
+		return
+	}
 	for {
 		select {
 		case <-r.notify:
-			r.instanceCh <- r.snapshot()
+			select {
+			case r.instanceCh <- r.snapshot():
+			case <-r.done:
+				return
+			}
 		case <-r.done:
 			return
 		}

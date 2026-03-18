@@ -111,10 +111,17 @@ func main() {
 
 	healthCheckAddr := fmt.Sprintf(":%d", flags.config.HealthCheckPort)
 	klog.Infof("Starting /healthz server on port %s", healthCheckAddr)
+	healthMux := http.NewServeMux()
+	healthMux.HandleFunc("/healthz", registry.Healthz)
+	healthSrv := &http.Server{Addr: healthCheckAddr, Handler: healthMux}
 	go func() {
-		http.HandleFunc("/healthz", registry.Healthz)
-		if err := http.ListenAndServe(healthCheckAddr, nil); err != nil {
-			klog.Fatalf("failed to start /healthz server: %v", err)
+		if err := healthSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			klog.Errorf("failed to start /healthz server: %v", err)
+		}
+	}()
+	defer func() {
+		if err := healthSrv.Close(); err != nil {
+			klog.Errorf("failed to close /healthz server: %v", err)
 		}
 	}()
 
