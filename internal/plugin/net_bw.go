@@ -39,6 +39,8 @@ func (n *networkBandwidth) Allocate(context.Context) (*pluginapi.ContainerAlloca
 	return response, nil
 }
 
+// NetBWMatcherTemplater returns a FromDevice function that produces a
+// ResourceTemplate for net devices whose INTERFACE property matches matcher.
 func NetBWMatcherTemplater(domain string, matcher *regexp.Regexp) FromDevice[*ResourceTemplate] {
 	return func(dev udev.Device) (*ResourceTemplate, error) {
 		if dev.Subsystem() != udev.NetSubsystem {
@@ -64,6 +66,9 @@ func NetBWMatcherTemplater(domain string, matcher *regexp.Regexp) FromDevice[*Re
 	}
 }
 
+// NetBWMatcherInstances returns a FromDevice function that produces one
+// networkBandwidth instance per share (speed ÷ mbpsPerShare) for matching
+// net devices.
 func NetBWMatcherInstances(domain string, matcher *regexp.Regexp, mbpsPerShare uint) FromDevice[[]*networkBandwidth] {
 	return func(dev udev.Device) ([]*networkBandwidth, error) {
 		if dev.Subsystem() != udev.NetSubsystem {

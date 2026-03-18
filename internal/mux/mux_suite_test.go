@@ -96,8 +96,8 @@ var _ = Describe("Mux", func() {
 		})
 
 		It("should distribute values to all registered outputs", func() {
-			in1 := make(chan string)
-			in2 := make(chan string)
+			in1 := make(chan string, 1)
+			in2 := make(chan string, 1)
 			cancel1 := m.Subscribe(mux.SinkFromChan(in1))
 			cancel2 := m.Subscribe(mux.SinkFromChan(in2))
 			defer cancel1()
@@ -178,8 +178,8 @@ var _ = Describe("Mux", func() {
 	Context("closing", func() {
 		It("should properly clean up when closed", func() {
 			m := mux.Make[string]()
-			in1 := make(chan string)
-			in2 := make(chan string)
+			in1 := make(chan string, 1)
+			in2 := make(chan string, 1)
 			m.Subscribe(mux.SinkFromChan(in1))
 			m.Subscribe(mux.SinkFromChan(in2))
 

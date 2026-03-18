@@ -23,7 +23,7 @@ import (
 	"github.com/ydb-platform/udev-manager/internal/udev"
 )
 
-const DEFAULT_HEALTHCHECK_PORT = 8080
+const defaultHealthcheckPort = 8080
 
 func main() {
 	appContext, appCancel := context.WithCancel(context.Background())
@@ -50,7 +50,7 @@ func main() {
 
 	domain := flags.config.DeviceDomain
 
-	var cancel mux.CancelFunc = mux.CancelFunc(appCancel)
+	cancel := mux.CancelFunc(appCancel)
 	for _, partConfig := range flags.config.Partitions {
 		partDomain := partConfig.DomainOverride
 		if partDomain == "" {
@@ -66,6 +66,7 @@ func main() {
 			cancel,
 		)
 	}
+
 
 	for _, netBWConfig := range flags.config.NetworkBandwidth {
 		cancel = mux.ChainCancelFunc(
@@ -159,11 +160,11 @@ func (scs *stdinConfigSource) String() string {
 	return "stdin"
 }
 
-type ConfigFlag struct {
+type configFlag struct {
 	configSource
 }
 
-func (cf *ConfigFlag) Set(value string) error {
+func (cf *configFlag) Set(value string) error {
 	if strings.HasPrefix(value, "file:") {
 		cf.configSource = &fileConfigSource{path: strings.TrimPrefix(value, "file:")}
 	} else if strings.HasPrefix(value, "env:") {
@@ -177,40 +178,44 @@ func (cf *ConfigFlag) Set(value string) error {
 	return nil
 }
 
-func (cf *ConfigFlag) String() string {
+func (cf *configFlag) String() string {
 	if cf.configSource == nil {
 		return ""
 	}
 	return cf.configSource.String()
 }
 
-type FlagValues struct {
-	Config ConfigFlag
+type flagValues struct {
+	configSource configFlag
 
-	config *Config
+	config *appConfig
 }
 
-func initFlags() FlagValues {
-	values := FlagValues{}
+func initFlags() flagValues {
+	values := flagValues{}
 	flags := flag.NewFlagSet("udev-manager", flag.ExitOnError)
 	klog.InitFlags(flags)
-	flags.Var(&values.Config, "config", `configuration source (in form "file:<path>", "env:<ENV_VARIABLE>" or "stdin")`)
-	flags.Parse(os.Args[1:])
-	if values.Config.configSource == nil {
-		flags.Output().Write([]byte("config flag is required\n"))
+	flags.Var(&values.configSource, "config", `configuration source (in form "file:<path>", "env:<ENV_VARIABLE>" or "stdin")`)
+	_ = flags.Parse(os.Args[1:])
+	if values.configSource.configSource == nil {
+		_, _ = fmt.Fprint(flags.Output(), "config flag is required\n")
 		flags.Usage()
 		os.Exit(2)
 	}
-	configReader, configCloser, err := values.Config.open()
+	configReader, configCloser, err := values.configSource.open()
 	if err != nil {
-		klog.Fatalf("failed to open --config %q: %v", values.Config.String(), err)
+		klog.Fatalf("failed to open --config %q: %v", values.configSource.String(), err)
 		os.Exit(1)
 	}
-	defer configCloser()
+	defer func() {
+		if err := configCloser(); err != nil {
+			klog.Warningf("failed to close config source: %v", err)
+		}
+	}()
 
 	config, err := parseConfig(configReader)
 	if err != nil {
-		klog.Fatalf("failed to parse --config %q: %v", values.Config.String(), err)
+		klog.Fatalf("failed to parse --config %q: %v", values.configSource.String(), err)
 		os.Exit(1)
 	}
 
@@ -223,14 +228,14 @@ var (
 	deviceDomainRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
 )
 
-type PartitionsConfig struct {
+type partitionsConfig struct {
 	Matcher        string `yaml:"matcher"`          // matcher should be a valid regular expression
 	DomainOverride string `yaml:"domain,omitempty"` // optional override for the domain
 
 	matcher *regexp.Regexp // compiled matcher if the config is valid
 }
 
-func (pc *PartitionsConfig) validate() error {
+func (pc *partitionsConfig) validate() error {
 	if pc.DomainOverride != "" {
 		if !deviceDomainRegex.MatchString(pc.DomainOverride) {
 			return fmt.Errorf(".domain: %q must be a valid domain name", pc.DomainOverride)
@@ -248,14 +253,16 @@ func (pc *PartitionsConfig) validate() error {
 	return nil
 }
 
-type HostDevConfig struct {
+
+
+type hostDevConfig struct {
 	Matcher string `yaml:"matcher"` // matcher should be a valid regular expression
 	Prefix  string `yaml:"prefix"`
 
 	matcher *regexp.Regexp // compiled matcher if the config is valid
 }
 
-func (hc *HostDevConfig) validate() error {
+func (hc *hostDevConfig) validate() error {
 	// Compile the regular expression
 	matcher, err := regexp.Compile(hc.Matcher)
 	if err != nil {
@@ -265,14 +272,14 @@ func (hc *HostDevConfig) validate() error {
 	return nil
 }
 
-type NetBWConfig struct {
+type netBWConfig struct {
 	Matcher      string `yaml:"matcher"` // matcher should be a valid regular expression
 	MbpsPerShare uint   `yaml:"mbpsPerShare"`
 
 	matcher *regexp.Regexp // compiled matcher if the config is valid
 }
 
-func (nbc *NetBWConfig) validate() error {
+func (nbc *netBWConfig) validate() error {
 	// Compile the regular expression
 	matcher, err := regexp.Compile(nbc.Matcher)
 	if err != nil {
@@ -282,14 +289,14 @@ func (nbc *NetBWConfig) validate() error {
 	return nil
 }
 
-type NetRdmaConfig struct {
+type netRdmaConfig struct {
 	Matcher       string `yaml:"matcher"` // matcher should be a valid regular expression
 	ResourceCount uint   `yaml:"resourceCount"`
 
 	matcher *regexp.Regexp // compiled matcher if the config is valid
 }
 
-func (nrc *NetRdmaConfig) validate() error {
+func (nrc *netRdmaConfig) validate() error {
 	// Compile the regular expression
 	matcher, err := regexp.Compile(nrc.Matcher)
 	if err != nil {
@@ -299,17 +306,17 @@ func (nrc *NetRdmaConfig) validate() error {
 	return nil
 }
 
-type Config struct {
-	DeviceDomain         string             `yaml:"domain"`
-	DisableTopologyHints bool               `yaml:"disable_topology_hints"`
-	HealthCheckPort      uint16             `yaml:"health_check_port"`
-	Partitions           []PartitionsConfig `yaml:"partitions"`
-	HostDevs             []HostDevConfig    `yaml:"hostdevs"`
-	NetworkBandwidth     []NetBWConfig      `yaml:"networkBandwidth"`
-	NetworkRdma          []NetRdmaConfig    `yaml:"networkRdma"`
+type appConfig struct {
+	DeviceDomain         string                  `yaml:"domain"`
+	DisableTopologyHints bool                    `yaml:"disable_topology_hints"`
+	HealthCheckPort      uint16                  `yaml:"health_check_port"`
+	Partitions           []partitionsConfig      `yaml:"partitions"`
+	HostDevs             []hostDevConfig         `yaml:"hostdevs"`
+	NetworkBandwidth     []netBWConfig           `yaml:"networkBandwidth"`
+	NetworkRdma          []netRdmaConfig         `yaml:"networkRdma"`
 }
 
-func (c *Config) validate() error {
+func (c *appConfig) validate() error {
 	var errs error
 	// Validate the device domain
 	if c.DeviceDomain == "" {
@@ -319,44 +326,45 @@ func (c *Config) validate() error {
 		errs = errors.Join(errs, fmt.Errorf(".domain: %q must be a valid domain name", c.DeviceDomain))
 	}
 	if c.HealthCheckPort == 0 {
-		c.HealthCheckPort = DEFAULT_HEALTHCHECK_PORT
+		c.HealthCheckPort = defaultHealthcheckPort
 	}
 
 	// Validate partitions
 	for i := range c.Partitions {
 		if err := c.Partitions[i].validate(); err != nil {
-			errs = errors.Join(errs, fmt.Errorf(".partitions[%d]%w", i, err))
+			errs = errors.Join(errs, fmt.Errorf(".partitions[%d]: %w", i, err))
 		}
 	}
+
 
 	// Validate hostdevs
 	for i := range c.HostDevs {
 		if err := c.HostDevs[i].validate(); err != nil {
-			errs = errors.Join(errs, fmt.Errorf(".hostdevs[%d]%w", i, err))
+			errs = errors.Join(errs, fmt.Errorf(".hostdevs[%d]: %w", i, err))
 		}
 	}
 
 	// Validate network bandwidth
 	for i := range c.NetworkBandwidth {
 		if err := c.NetworkBandwidth[i].validate(); err != nil {
-			errs = errors.Join(errs, fmt.Errorf(".networkBandwidth[%d]%w", i, err))
+			errs = errors.Join(errs, fmt.Errorf(".networkBandwidth[%d]: %w", i, err))
 		}
 	}
 
 	// Validate network rdma
 	for i := range c.NetworkRdma {
 		if err := c.NetworkRdma[i].validate(); err != nil {
-			errs = errors.Join(errs, fmt.Errorf(".networkRdma[%d]%w", i, err))
+			errs = errors.Join(errs, fmt.Errorf(".networkRdma[%d]: %w", i, err))
 		}
 	}
 
-	return nil
+	return errs
 }
 
-func parseConfig(reader io.Reader) (*Config, error) {
+func parseConfig(reader io.Reader) (*appConfig, error) {
 	// Parse the config file
 	decoder := yaml.NewDecoder(reader)
-	config := &Config{}
+	config := &appConfig{}
 	if err := decoder.Decode(config); err != nil {
 		return nil, err
 	}

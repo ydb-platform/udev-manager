@@ -52,6 +52,9 @@ func (n *netRdma) Allocate(context.Context) (*pluginapi.ContainerAllocateRespons
 
 }
 
+// NetRdmaMatcherTemplater returns a FromDevice function that produces a
+// ResourceTemplate for RDMA-capable net devices whose INTERFACE matches
+// matcher.
 func NetRdmaMatcherTemplater(domain string, matcher *regexp.Regexp) FromDevice[*ResourceTemplate] {
 	return func(dev udev.Device) (*ResourceTemplate, error) {
 		if dev.Subsystem() != udev.NetSubsystem {
@@ -77,6 +80,8 @@ func NetRdmaMatcherTemplater(domain string, matcher *regexp.Regexp) FromDevice[*
 	}
 }
 
+// NetRdmaMatcherInstances returns a FromDevice function that produces
+// resourcesCount netRdma instances for each matching RDMA-capable net device.
 func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesCount int) FromDevice[[]*netRdma] {
 	return func(dev udev.Device) ([]*netRdma, error) {
 		if dev.Subsystem() != udev.NetSubsystem {
