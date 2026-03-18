@@ -1,0 +1,30 @@
+domain: 'ydb.tech'
+
+# batchPartitions groups all partitions matching a regexp into a single
+# allocatable Kubernetes resource. A pod requesting one unit of that resource
+# receives device specs and environment variables for every partition in the
+# group simultaneously.
+#
+# This is useful when a workload must own a whole set of disks at once (e.g. a
+# RAID or striped volume) rather than individual partitions.
+#
+# Each entry creates one resource:
+#   ydb.tech/batch-<name>
+#
+# 'count' controls how many pods may hold the resource concurrently
+# (default: 1).
+
+batchPartitions:
+  # NVMe data drives — up to 2 pods can each hold the full set simultaneously.
+  - name: nvme-data
+    matcher: 'nvme_data_.*'
+    count: 2
+
+  # SSD write-ahead log — exclusive access (count defaults to 1).
+  - name: ssd-wal
+    matcher: 'ssd_wal_.*'
+
+  # Rotational bulk-storage drives on a separate resource domain.
+  - name: hdd-bulk
+    matcher: 'hdd_bulk_.*'
+    domain: storage.ydb.tech

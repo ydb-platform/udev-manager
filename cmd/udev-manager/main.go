@@ -67,6 +67,23 @@ func main() {
 		)
 	}
 
+	for _, batchConfig := range flags.config.BatchPartitions {
+		batchDomain := batchConfig.DomainOverride
+		if batchDomain == "" {
+			batchDomain = domain
+		}
+		cancel = mux.ChainCancelFunc(
+			plugin.NewBatchPartitionScatter(
+				devDiscovery,
+				registry,
+				batchDomain,
+				batchConfig.Name,
+				batchConfig.matcher,
+				batchConfig.Count,
+			),
+			cancel,
+		)
+	}
 
 	for _, netBWConfig := range flags.config.NetworkBandwidth {
 		cancel = mux.ChainCancelFunc(
@@ -253,7 +270,37 @@ func (pc *partitionsConfig) validate() error {
 	return nil
 }
 
+type batchPartitionsConfig struct {
+	Name           string `yaml:"name"`
+	Matcher        string `yaml:"matcher"`
+	Count          int    `yaml:"count,omitempty"` // default 1
+	DomainOverride string `yaml:"domain,omitempty"`
 
+	matcher *regexp.Regexp // compiled matcher if the config is valid
+}
+
+func (bc *batchPartitionsConfig) validate() error {
+	if bc.Name == "" {
+		return fmt.Errorf(".name: must not be empty")
+	}
+	if bc.DomainOverride != "" {
+		if !deviceDomainRegex.MatchString(bc.DomainOverride) {
+			return fmt.Errorf(".domain: %q must be a valid domain name", bc.DomainOverride)
+		}
+	}
+	matcher, err := regexp.Compile(bc.Matcher)
+	if err != nil {
+		return fmt.Errorf(".matcher: %q must be a valid regexp: %w", bc.Matcher, err)
+	}
+	bc.matcher = matcher
+	if bc.Count < 0 {
+		return fmt.Errorf(".count: must be >= 0, got %d", bc.Count)
+	}
+	if bc.Count == 0 {
+		bc.Count = 1
+	}
+	return nil
+}
 
 type hostDevConfig struct {
 	Matcher string `yaml:"matcher"` // matcher should be a valid regular expression
@@ -311,6 +358,7 @@ type appConfig struct {
 	DisableTopologyHints bool                    `yaml:"disable_topology_hints"`
 	HealthCheckPort      uint16                  `yaml:"health_check_port"`
 	Partitions           []partitionsConfig      `yaml:"partitions"`
+	BatchPartitions      []batchPartitionsConfig `yaml:"batchPartitions"`
 	HostDevs             []hostDevConfig         `yaml:"hostdevs"`
 	NetworkBandwidth     []netBWConfig           `yaml:"networkBandwidth"`
 	NetworkRdma          []netRdmaConfig         `yaml:"networkRdma"`
@@ -336,6 +384,12 @@ func (c *appConfig) validate() error {
 		}
 	}
 
+	// Validate batch partitions
+	for i := range c.BatchPartitions {
+		if err := c.BatchPartitions[i].validate(); err != nil {
+			errs = errors.Join(errs, fmt.Errorf(".batchPartitions[%d]%w", i, err))
+		}
+	}
 
 	// Validate hostdevs
 	for i := range c.HostDevs {
