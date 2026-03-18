@@ -15,6 +15,8 @@ import (
 	"github.com/ydb-platform/udev-manager/internal/mux"
 )
 
+// Well-known udev subsystem names, device-type values, property keys,
+// sysfs attribute names, and action strings used throughout the package.
 const (
 	BlockSubsystem = "block"
 	NetSubsystem   = "net"
@@ -178,20 +180,38 @@ func (g *generic) Debug() string {
 	)
 }
 
+// subscribeReq is a request sent to the slice goroutine to register a new
+// downstream sink. The goroutine is the sole owner of the slice state, so
+// routing Subscribe through it lets us atomically snapshot and register
+// without holding a mutex.
+type subscribeReq struct {
+	sink  mux.Sink[[]Device]
+	reply chan mux.CancelFunc
+}
+
 type udevSlice struct {
-	discovery *udevDiscovery
-	state     map[Id]Device
-	filter    mux.FilterFunc[Device]
-	mux       *mux.Mux[[]Device]
-	stop      mux.CancelFunc
+	state      map[Id]Device
+	filter     mux.FilterFunc[Device]
+	mux        *mux.Mux[[]Device]
+	stop       mux.CancelFunc
+	subscribeC chan subscribeReq
 }
 
 func (s *udevSlice) Close() {
 	s.stop()
 }
 
+// Subscribe registers sink to receive every future device-set snapshot. It
+// also immediately delivers the current snapshot to sink so the caller has a
+// consistent starting view without any race against concurrent updates.
+//
+// The replay and the subsequent mux subscription happen inside the slice's
+// goroutine, which is the sole owner of state, so there is no window where an
+// update could be missed or delivered twice.
 func (s *udevSlice) Subscribe(sink mux.Sink[[]Device]) mux.CancelFunc {
-	return s.mux.Subscribe(sink)
+	replyCh := make(chan mux.CancelFunc)
+	s.subscribeC <- subscribeReq{sink: sink, reply: replyCh}
+	return <-replyCh
 }
 
 type udevDiscovery struct {
@@ -202,6 +222,9 @@ type udevDiscovery struct {
 	wg       *sync.WaitGroup
 }
 
+// NewDiscovery creates a real udev-backed Discovery. It enumerates all
+// currently present devices and starts a monitor goroutine that publishes
+// Added and Removed events as the kernel reports them.
 func NewDiscovery(wg *sync.WaitGroup) (Discovery, error) {
 	d := &udevDiscovery{
 		state:    make(map[Id]Device),
@@ -257,57 +280,87 @@ func (d *udevDiscovery) DeviceById(id Id) Device {
 }
 
 func (d *udevDiscovery) Slice(filter mux.FilterFunc[Device]) Slice {
+	return makeSlice(d, filter)
+}
+
+// makeSlice creates a Slice backed by any event Source. It subscribes to src
+// (receiving an Init followed by Add/Remove events), applies filter, and
+// publishes the current matching device set to downstream subscribers each
+// time the set changes.
+//
+// Slice.Subscribe replays the current state to every new subscriber so callers
+// always receive a consistent snapshot before any subsequent updates.
+func makeSlice(src mux.Source[Event], filter mux.FilterFunc[Device]) Slice {
 	slice := &udevSlice{
-		discovery: d,
-		state:     make(map[Id]Device),
-		filter:    filter,
-		mux:       mux.Make[[]Device](),
+		state:      make(map[Id]Device),
+		filter:     filter,
+		mux:        mux.Make[[]Device](),
+		subscribeC: make(chan subscribeReq),
 	}
 
 	evCh := make(chan Event)
 
 	go func() {
 		defer slice.mux.Close()
-		for ev := range evCh { // exits on close
-			switch e := ev.(type) {
-			case Init:
-				for _, dev := range e.Devices {
-					if filter(dev) {
-						slice.state[dev.Id()] = dev
+		for {
+			select {
+			case ev, ok := <-evCh:
+				if !ok {
+					return
+				}
+				switch e := ev.(type) {
+				case Init:
+					for _, dev := range e.Devices {
+						if filter(dev) {
+							slice.state[dev.Id()] = dev
+						}
+					}
+					if err := slice.mux.Submit(sliceSnapshot(slice.state)); err != nil {
+						klog.Errorf("slice: failed to submit Init snapshot: %v", err)
+					}
+				case Added:
+					if filter(e.Device) {
+						slice.state[e.Id()] = e.Device
+						if err := slice.mux.Submit(sliceSnapshot(slice.state)); err != nil {
+							klog.Errorf("slice: failed to submit Added snapshot: %v", err)
+						}
+					}
+				case Removed:
+					if _, found := slice.state[e.Id()]; found {
+						delete(slice.state, e.Id())
+						if err := slice.mux.Submit(sliceSnapshot(slice.state)); err != nil {
+							klog.Errorf("slice: failed to submit Removed snapshot: %v", err)
+						}
 					}
 				}
-				copy := make([]Device, 0, len(slice.state))
-				for _, d := range slice.state {
-					copy = append(copy, d)
+
+			case req := <-slice.subscribeC:
+				// Register with the mux first, then replay the current
+				// snapshot. Because only this goroutine calls slice.mux.Submit,
+				// no update can arrive between the two steps, so the subscriber
+				// cannot miss a snapshot or receive one out of order.
+				cancel := slice.mux.Subscribe(req.sink)
+				if err := req.sink.Submit(sliceSnapshot(slice.state)); err != nil {
+					klog.Errorf("slice: failed to replay snapshot to new subscriber: %v", err)
 				}
-				slice.mux.Submit(copy)
-			case Added:
-				if filter(e.Device) {
-					slice.state[e.Device.Id()] = e.Device
-					copy := make([]Device, 0, len(slice.state))
-					for _, d := range slice.state {
-						copy = append(copy, d)
-					}
-					slice.mux.Submit(copy)
-				}
-			case Removed:
-				if _, found := slice.state[e.Device.Id()]; found {
-					delete(slice.state, e.Device.Id())
-					copy := make([]Device, 0, len(slice.state))
-					for _, d := range slice.state {
-						copy = append(copy, d)
-					}
-					slice.mux.Submit(copy)
-				}
+				req.reply <- cancel
 			}
 		}
 	}()
 
 	evSink := mux.SinkFromChan(evCh)
-	cancelEvSub := d.mux.Subscribe(evSink)
-	slice.stop = cancelEvSub
+	slice.stop = src.Subscribe(evSink)
 
 	return slice
+}
+
+// sliceSnapshot returns a stable copy of the device map as a slice.
+func sliceSnapshot(state map[Id]Device) []Device {
+	result := make([]Device, 0, len(state))
+	for _, d := range state {
+		result = append(result, d)
+	}
+	return result
 }
 
 func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
@@ -334,12 +387,16 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 					dev:  dev,
 				}
 				d.state[id] = dev
-				d.mux.Submit(Added{dev})
+				if err := d.mux.Submit(Added{dev}); err != nil {
+					klog.Errorf("udev: failed to submit Added event: %v", err)
+				}
 			case ActionRemove, ActionOffline:
 				id := Id(dev.Syspath())
 				dev := d.state[id]
 				delete(d.state, id)
-				d.mux.Submit(Removed{dev})
+				if err := d.mux.Submit(Removed{dev}); err != nil {
+					klog.Errorf("udev: failed to submit Removed event: %v", err)
+				}
 			}
 		case req := <-d.requests:
 			switch r := req.Value().(type) {
