@@ -46,12 +46,20 @@ func newPlugin(resource Resource, ctx context.Context, wg *sync.WaitGroup) (*plu
 		return nil, fmt.Errorf("failed to listen on socket %s: %w", socketPath, err)
 	}
 
-	go server.Serve(listener)
+	go func() {
+		if err := server.Serve(listener); err != nil && err != grpc.ErrServerStopped {
+			klog.Errorf("%q: gRPC server error: %v", plugin.resource.Name(), err)
+		}
+	}()
 
 	wg.Add(1)
 	go func(ctx context.Context, wg *sync.WaitGroup, l net.Listener, s *grpc.Server) {
 		defer wg.Done()
-		defer l.Close()
+		defer func() {
+			if err := l.Close(); err != nil {
+				klog.Errorf("failed to close listener: %v", err)
+			}
+		}()
 		defer s.Stop()
 		klog.Infof("Serving device plugin %q on socket %q", plugin.resource.Name(), socketPath)
 		<-ctx.Done()
@@ -162,25 +170,27 @@ func (p *plugin) socketPath() string {
 }
 
 func (p *plugin) probe(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	timeoutCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
 	pluginAddr := "unix://" + pluginapi.DevicePluginPath + p.socketPath()
 
-	conn, err := grpc.DialContext(
-		ctx,
+	conn, err := grpc.NewClient(
 		pluginAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 	)
 	if err != nil {
 		klog.Errorf("%q: failed to dial %q: %v", p.resource.Name(), pluginAddr, err)
 		return fmt.Errorf("failed to dial %q: %w", pluginAddr, err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			klog.Errorf("%q: failed to close connection: %v", p.resource.Name(), err)
+		}
+	}()
 
 	client := pluginapi.NewDevicePluginClient(conn)
-	_, err = client.GetDevicePluginOptions(context.Background(), &pluginapi.Empty{})
+	_, err = client.GetDevicePluginOptions(timeoutCtx, &pluginapi.Empty{})
 
 	if err != nil {
 		klog.Errorf("%q: failed to get device plugin options: %v", p.resource.Name(), err)

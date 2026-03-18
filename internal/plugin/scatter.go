@@ -7,6 +7,9 @@ import (
 	"github.com/ydb-platform/udev-manager/internal/udev"
 )
 
+// Scatter subscribes to a udev [Discovery] and dynamically creates or updates
+// [Resource] instances as matching devices are added or removed. Each unique
+// ResourceTemplate produced by the templater gets its own Resource.
 type Scatter[T Instance] struct {
 	templater FromDevice[*ResourceTemplate]
 	mapper    FromDevice[[]T]
@@ -14,6 +17,9 @@ type Scatter[T Instance] struct {
 	routes    map[ResourceTemplate]Resource
 }
 
+// NewScatter creates a [Scatter] that subscribes to d and routes matching
+// devices to resources via templater and mapper. It returns a CancelFunc that
+// unsubscribes and stops the scatter goroutine.
 func NewScatter[T Instance](
 	d udev.Discovery,
 	registry *Registry,
@@ -26,7 +32,7 @@ func NewScatter[T Instance](
 		registry:  registry,
 		routes:    make(map[ResourceTemplate]Resource),
 	}
-	ch := make(chan udev.Event)
+	ch := make(chan udev.Event, 1)
 
 	go scatter.run(ch)
 
@@ -46,7 +52,7 @@ func (s *Scatter[T]) added(dev udev.Device) {
 	}
 
 	if template == nil {
-		klog.V(5).Info("unmatched device: %q, template is nil", dev.Debug())
+		klog.V(5).Infof("unmatched device: %q, template is nil", dev.Debug())
 		return
 	}
 
@@ -56,26 +62,24 @@ func (s *Scatter[T]) added(dev udev.Device) {
 		return
 	}
 
-	klog.V(5).Info("Init: Matched device: %q", dev.Debug())
+	klog.V(5).Infof("Init: Matched device: %q", dev.Debug())
 
 	if res, ok := s.routes[*template]; ok {
-		klog.V(5).Info("Init: Matched resource: %s", res.Name())
-		res.Submit(HealthEvent{
+		klog.V(5).Infof("Init: Matched resource: %s", res.Name())
+		if err := res.Submit(HealthEvent{
 			Instances: unpack(instances...),
 			Health:    Healthy{},
-		})
+		}); err != nil {
+			klog.Errorf("failed to submit health event for %s: %v", res.Name(), err)
+		}
 		return
 	}
 
-	res := &resource{
-		resourceTemplate: *template,
-		instances:        make(map[Id]Instance),
-		healthCh:         make(chan HealthEvent),
-	}
-
+	instanceMap := make(map[Id]Instance, len(instances))
 	for _, instance := range instances {
-		res.instances[instance.Id()] = instance
+		instanceMap[instance.Id()] = instance
 	}
+	res := newResource(*template, instanceMap)
 
 	err = s.registry.Add(res)
 	if err != nil {
@@ -98,7 +102,7 @@ func (s *Scatter[T]) removed(dev udev.Device) {
 	}
 
 	if template == nil {
-		klog.V(5).Info("unmatched device: %q, template is nil", dev.Debug())
+		klog.V(5).Infof("unmatched device: %q, template is nil", dev.Debug())
 		return
 	}
 
@@ -108,14 +112,16 @@ func (s *Scatter[T]) removed(dev udev.Device) {
 		return
 	}
 
-	klog.V(5).Info("Removed: Matched device: %q", dev.Debug())
+	klog.V(5).Infof("Removed: Matched device: %q", dev.Debug())
 
 	if res, ok := s.routes[*template]; ok {
-		klog.V(5).Info("Removed: Matched resource: %s", res.Name())
-		res.Submit(HealthEvent{
+		klog.V(5).Infof("Removed: Matched resource: %s", res.Name())
+		if err := res.Submit(HealthEvent{
 			Instances: unpack(instances...),
 			Health:    Unhealthy{},
-		})
+		}); err != nil {
+			klog.Errorf("failed to submit health event for %s: %v", res.Name(), err)
+		}
 	} else {
 		klog.Errorf("failed to find resource for 'Removed' event for device %q", dev.Debug())
 	}

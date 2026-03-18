@@ -52,42 +52,49 @@ func sanitizeEnv(s string) string {
 	return strings.ToUpper(replacer.Replace(s))
 }
 
-func (p *partition) envName(env string) string {
-	return sanitizeEnv(p.domain) + "_PART_" + sanitizeEnv(p.label) + "_" + sanitizeEnv(env)
+func (p *partition) Allocate(context.Context) (*pluginapi.ContainerAllocateResponse, error) {
+	response := allocatePartitionDevice(p.dev, p.domain, p.label)
+	klog.Info("allocated partition: ", p.label)
+	klog.V(2).Infof("%+v", response)
+	return response, nil
 }
 
-func (p *partition) Allocate(context.Context) (*pluginapi.ContainerAllocateResponse, error) {
+func allocatePartitionDevice(dev udev.Device, domain, label string) *pluginapi.ContainerAllocateResponse {
 	response := &pluginapi.ContainerAllocateResponse{}
 
-	containerPath := path.Join("/dev", "allocated", p.domain, "part", p.label)
+	containerPath := path.Join("/dev", "allocated", domain, "part", label)
 
 	response.Devices = append(response.Devices, &pluginapi.DeviceSpec{
-		HostPath:      p.dev.DevNode(),
+		HostPath:      dev.DevNode(),
 		ContainerPath: containerPath,
 		Permissions:   "rw",
 	})
 
-	response.Envs = make(map[string]string)
-	response.Envs[p.envName("PATH")] = containerPath
-	response.Envs[p.envName("DISK_ID")] =
-		p.dev.SystemAttributeLookup(udev.SysAttrWWID)
-	response.Envs[p.envName("DISK_MODEL")] =
-		p.dev.SystemAttributeLookup(udev.SysAttrModel)
+	envName := func(env string) string {
+		return sanitizeEnv(domain) + "_PART_" + sanitizeEnv(label) + "_" + sanitizeEnv(env)
+	}
 
-	serial := p.dev.SystemAttributeLookup(udev.SysAttrSerial)
+	response.Envs = make(map[string]string)
+	response.Envs[envName("PATH")] = containerPath
+	response.Envs[envName("DISK_ID")] =
+		dev.SystemAttributeLookup(udev.SysAttrWWID)
+	response.Envs[envName("DISK_MODEL")] =
+		dev.SystemAttributeLookup(udev.SysAttrModel)
+
+	serial := dev.SystemAttributeLookup(udev.SysAttrSerial)
 	if serial == "" {
-		serial = p.dev.PropertyLookup(udev.PropertyShortSerial)
+		serial = dev.PropertyLookup(udev.PropertyShortSerial)
 	}
 	if serial != "" {
-		response.Envs[p.envName("DISK_SERIAL")] = serial
+		response.Envs[envName("DISK_SERIAL")] = serial
 	}
 
-	klog.Info("allocated partition: ", p.label)
-	klog.V(2).Infof("%+v", response)
-
-	return response, nil
+	return response
 }
 
+// PartitionLabelMatcherTemplater returns a FromDevice function that produces a
+// ResourceTemplate for block partition devices whose PARTNAME matches matcher.
+// The first capture group (if any) is used as the label suffix.
 func PartitionLabelMatcherTemplater(domain string, matcher *regexp.Regexp) FromDevice[*ResourceTemplate] {
 	return func(dev udev.Device) (*ResourceTemplate, error) {
 		if dev.Subsystem() != udev.BlockSubsystem {
@@ -116,6 +123,10 @@ func PartitionLabelMatcherTemplater(domain string, matcher *regexp.Regexp) FromD
 	}
 }
 
+// PartitionLabelMatcherInstances returns a FromDevice function that produces
+// partition instances for matching block devices. Each matching device becomes
+// one instance whose label is the first capture group of matcher (or the full
+// PARTNAME if there are no capture groups).
 func PartitionLabelMatcherInstances(domain string, matcher *regexp.Regexp, disableTopologyHints bool) FromDevice[[]*partition] {
 	return func(dev udev.Device) ([]*partition, error) {
 		var part *partition

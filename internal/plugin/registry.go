@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"path"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -29,7 +30,7 @@ const kubeletAddr = "unix://" + pluginapi.KubeletSocket
 
 // register advertises plugin socket to the kubelet.
 func (r *Registry) register(plugin *plugin) error {
-	conn, err := grpc.Dial(kubeletAddr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	conn, err := grpc.NewClient(kubeletAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		klog.Errorf("failed to dial %q: %v", kubeletAddr, err)
 		return err
@@ -43,7 +44,10 @@ func (r *Registry) register(plugin *plugin) error {
 
 	client := pluginapi.NewRegistrationClient(conn)
 
-	_, err = client.Register(context.Background(), &pluginapi.RegisterRequest{
+	ctx, cancel := context.WithTimeout(r.ctx, 10*time.Second)
+	defer cancel()
+
+	_, err = client.Register(ctx, &pluginapi.RegisterRequest{
 		ResourceName: plugin.resource.Name(),
 		Version:      pluginapi.Version,
 		Endpoint:     plugin.socketPath(),
@@ -95,12 +99,21 @@ func NewRegistry(ctx context.Context, wg *sync.WaitGroup) (*Registry, error) {
 		watcher: watcher,
 	}
 
-	watcher.Add(path.Join(pluginapi.KubeletSocket))
+	if err := watcher.Add(path.Join(pluginapi.KubeletSocket)); err != nil {
+		if closeErr := watcher.Close(); closeErr != nil {
+			klog.Errorf("failed to close watcher: %v", closeErr)
+		}
+		return nil, fmt.Errorf("failed to watch kubelet socket: %w", err)
+	}
 
 	registry.wg.Add(1)
 	go func(r *Registry) {
 		defer r.wg.Done()
-		defer r.watcher.Close()
+		defer func() {
+			if err := r.watcher.Close(); err != nil {
+				klog.Errorf("failed to close watcher: %v", err)
+			}
+		}()
 
 		for {
 			select {
@@ -118,6 +131,9 @@ func NewRegistry(ctx context.Context, wg *sync.WaitGroup) (*Registry, error) {
 	return registry, nil
 }
 
+// Healthz is an HTTP handler that reports the health of all registered device
+// plugins. It returns 200 OK if all plugins pass their probe, or 500 Internal
+// Server Error listing the failing plugins.
 func (r *Registry) Healthz(resp http.ResponseWriter, req *http.Request) {
 	unhealthy := make([]string, 0)
 	r.plugins.Range(func(_, p interface{}) bool {
@@ -136,7 +152,7 @@ func (r *Registry) Healthz(resp http.ResponseWriter, req *http.Request) {
 	} else {
 		resp.WriteHeader(http.StatusInternalServerError)
 		for _, name := range unhealthy {
-			fmt.Fprintf(resp, "probe failed for device plugin %q\n", name)
+			_, _ = fmt.Fprintf(resp, "probe failed for device plugin %q\n", name)
 		}
 	}
 }
