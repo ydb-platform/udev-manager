@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Style checks
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install libudev-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -q libudev-dev
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.1
+        env:
+          CGO_ENABLED: "1"
+
+  # ---------------------------------------------------------------------------
+  # Build + test
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install libudev-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -q libudev-dev
+
+      - name: Build
+        run: CGO_ENABLED=1 go build ./...
+
+      - name: Test
+        run: CGO_ENABLED=1 go test -race -count=1 -timeout 60s ./...

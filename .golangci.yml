@@ -1,0 +1,30 @@
+version: "2"
+
+formatters:
+  enable:
+    - gofmt        # formatting (mirrors the gofmt -l check in CI)
+
+linters:
+  # Start from the golangci-lint defaults and add a few extras.
+  # Defaults enabled: errcheck, gosimple, govet, ineffassign, staticcheck, unused.
+  enable:
+    - revive       # lightweight style linter (replaces deprecated golint)
+    - misspell     # catches common spelling mistakes in comments/strings
+    - unconvert    # removes unnecessary type conversions
+
+  settings:
+    revive:
+      rules:
+        # Require exported symbols to have doc comments.
+        - name: exported
+          arguments:
+            - disableStutteringCheck   # allow e.g. "type MuxOption interface"
+
+  exclusions:
+    rules:
+      # Don't require doc comments or flag errcheck failures in test files —
+      # test helpers are internal and intentionally terse.
+      - path: _test\.go
+        linters:
+          - revive
+          - errcheck
