@@ -78,7 +78,9 @@ func (g *generic) Id() Id {
 func (g *generic) Parent() Device {
 	g.parentOnce.Do(func() {
 		if g.parent == nil {
-			g.parent = g.udev.DeviceById(Id(g.dev.Syspath()))
+			if p := g.dev.Parent(); p != nil {
+				g.parent = g.udev.DeviceById(Id(p.Syspath()))
+			}
 		}
 	})
 	return g.parent

@@ -134,6 +134,7 @@ func NewBatchPartitionScatter(
 
 	if err := registry.Add(res); err != nil {
 		klog.Errorf("failed to add batch partition resource %s: %v", res.Name(), err)
+		res.Close()
 		return func() {}
 	}
 

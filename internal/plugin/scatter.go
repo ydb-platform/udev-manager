@@ -84,6 +84,7 @@ func (s *Scatter[T]) added(dev udev.Device) {
 	err = s.registry.Add(res)
 	if err != nil {
 		klog.Errorf("failed to add resource %s: %v", res.Name(), err)
+		res.Close()
 		return
 	}
 	s.routes[*template] = res
