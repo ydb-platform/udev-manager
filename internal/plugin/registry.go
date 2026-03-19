@@ -20,19 +20,35 @@ import (
 // Registry is a lifecycle manager for plugins.
 // It is responsible for (re-)registering plugins with the kubelet.
 type Registry struct {
-	plugins sync.Map
-	ctx     context.Context
-	wg      *sync.WaitGroup
-	watcher *fsnotify.Watcher
+	plugins       sync.Map
+	ctx           context.Context
+	wg            *sync.WaitGroup
+	watcher       *fsnotify.Watcher
+	pluginDir     string
+	kubeletSocket string
 }
 
-const kubeletAddr = "unix://" + pluginapi.KubeletSocket
+// RegistryOption configures a [Registry] created by [NewRegistry].
+type RegistryOption func(*Registry)
+
+// WithPluginDir overrides the directory where plugin Unix sockets are created.
+// Defaults to pluginapi.DevicePluginPath.
+func WithPluginDir(dir string) RegistryOption {
+	return func(r *Registry) { r.pluginDir = dir }
+}
+
+// WithKubeletSocket overrides the path to the kubelet registration socket.
+// Defaults to pluginapi.KubeletSocket.
+func WithKubeletSocket(socketPath string) RegistryOption {
+	return func(r *Registry) { r.kubeletSocket = socketPath }
+}
 
 // register advertises plugin socket to the kubelet.
 func (r *Registry) register(plugin *plugin) error {
-	conn, err := grpc.NewClient(kubeletAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	addr := "unix://" + r.kubeletSocket
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		klog.Errorf("failed to dial %q: %v", kubeletAddr, err)
+		klog.Errorf("failed to dial %q: %v", addr, err)
 		return err
 	}
 	defer func() {
@@ -68,7 +84,7 @@ func (r *Registry) hup() {
 	r.plugins.Range(func(key, p interface{}) bool {
 		old := p.(*plugin)
 		old.stop()
-		newP, err := newPlugin(old.resource, r.ctx, r.wg)
+		newP, err := newPlugin(old.resource, r.ctx, r.wg, r.pluginDir)
 		if err != nil {
 			klog.Errorf("failed to create plugin for %s: %v", old.resource.Name(), err)
 			return true
@@ -86,7 +102,7 @@ func (r *Registry) hup() {
 // the registry will re-register all plugins.
 // `ctx`: context that controls the lifecycle of the registry.
 // `wg`: wait group that would be waited on before the registry is stopped.
-func NewRegistry(ctx context.Context, wg *sync.WaitGroup) (*Registry, error) {
+func NewRegistry(ctx context.Context, wg *sync.WaitGroup, opts ...RegistryOption) (*Registry, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		klog.Errorf("failed to create fsnotifier watcher: %v", err)
@@ -94,17 +110,28 @@ func NewRegistry(ctx context.Context, wg *sync.WaitGroup) (*Registry, error) {
 	}
 
 	registry := &Registry{
-		plugins: sync.Map{},
-		wg:      wg,
-		ctx:     ctx,
-		watcher: watcher,
+		plugins:       sync.Map{},
+		wg:            wg,
+		ctx:           ctx,
+		watcher:       watcher,
+		pluginDir:     pluginapi.DevicePluginPath,
+		kubeletSocket: pluginapi.KubeletSocket,
 	}
 
-	if err := watcher.Add(path.Join(pluginapi.KubeletSocket)); err != nil {
+	for _, opt := range opts {
+		opt(registry)
+	}
+
+	// Watch the parent directory of the kubelet socket, not the socket file
+	// itself. When kubelet restarts it removes and re-creates the socket;
+	// watching the file directly loses the inotify watch on deletion and
+	// never sees the subsequent CREATE.
+	kubeletSocketDir := path.Dir(registry.kubeletSocket)
+	if err := watcher.Add(kubeletSocketDir); err != nil {
 		if closeErr := watcher.Close(); closeErr != nil {
 			klog.Errorf("failed to close watcher: %v", closeErr)
 		}
-		return nil, fmt.Errorf("failed to watch kubelet socket: %w", err)
+		return nil, fmt.Errorf("failed to watch kubelet socket dir %q: %w", kubeletSocketDir, err)
 	}
 
 	registry.wg.Add(1)
@@ -119,7 +146,7 @@ func NewRegistry(ctx context.Context, wg *sync.WaitGroup) (*Registry, error) {
 		for {
 			select {
 			case event := <-r.watcher.Events:
-				if event.Op&fsnotify.Create != 0 {
+				if event.Op&fsnotify.Create != 0 && event.Name == r.kubeletSocket {
 					r.hup()
 				}
 			case <-r.ctx.Done():
@@ -162,7 +189,7 @@ func (r *Registry) Healthz(resp http.ResponseWriter, req *http.Request) {
 // kubelet. Attempts to register resource with the same name twice will result
 // in an error.
 func (r *Registry) Add(resource Resource) error {
-	plugin, err := newPlugin(resource, r.ctx, r.wg)
+	plugin, err := newPlugin(resource, r.ctx, r.wg, r.pluginDir)
 	if err != nil {
 		klog.Errorf("failed to create plugin for resource %q Cause: %v", resource.Name(), err)
 		return err

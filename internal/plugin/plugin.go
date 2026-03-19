@@ -20,20 +20,22 @@ import (
 )
 
 type plugin struct {
-	resource Resource
-	cancel   context.CancelFunc
-	stopped  chan struct{} // closed after gRPC server is fully stopped
+	resource  Resource
+	pluginDir string
+	cancel    context.CancelFunc
+	stopped   chan struct{} // closed after gRPC server is fully stopped
 }
 
-func newPlugin(resource Resource, ctx context.Context, wg *sync.WaitGroup) (*plugin, error) {
+func newPlugin(resource Resource, ctx context.Context, wg *sync.WaitGroup, pluginDir string) (*plugin, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	plugin := &plugin{
-		resource: resource,
-		cancel:   cancel,
-		stopped:  make(chan struct{}),
+		resource:  resource,
+		pluginDir: pluginDir,
+		cancel:    cancel,
+		stopped:   make(chan struct{}),
 	}
 
-	socketPath := pluginapi.DevicePluginPath + plugin.socketPath()
+	socketPath := pluginDir + plugin.socketPath()
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		klog.Errorf("%q: failed to remove socket file %q: %v", plugin.resource.Name(), socketPath, err)
 		return nil, fmt.Errorf("failed to remove socket file %s: %w", socketPath, err)
@@ -188,7 +190,7 @@ func (p *plugin) probe(ctx context.Context) error {
 	timeoutCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
-	pluginAddr := "unix://" + pluginapi.DevicePluginPath + p.socketPath()
+	pluginAddr := "unix://" + p.pluginDir + p.socketPath()
 
 	conn, err := grpc.NewClient(
 		pluginAddr,
