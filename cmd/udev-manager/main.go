@@ -33,13 +33,6 @@ func main() {
 
 	flags := initFlags()
 
-	// Registry creates a separate plugin for each resource registered
-	registry, err := plugin.NewRegistry(appContext, appWaitGroup)
-	if err != nil {
-		klog.Fatalf("failed to create plugin registry: %v", err)
-		os.Exit(1)
-	}
-
 	// udev discovery looks up devices and listens for system events
 	devDiscovery, err := udev.NewDiscovery(appWaitGroup)
 	if err != nil {
@@ -48,66 +41,12 @@ func main() {
 	}
 	defer devDiscovery.Close()
 
-	domain := flags.config.DeviceDomain
-
-	cancel := mux.CancelFunc(appCancel)
-	for _, partConfig := range flags.config.Partitions {
-		partDomain := partConfig.DomainOverride
-		if partDomain == "" {
-			partDomain = domain
-		}
-		cancel = mux.ChainCancelFunc(
-			plugin.NewScatter(
-				devDiscovery,
-				registry,
-				plugin.PartitionLabelMatcherTemplater(partDomain, partConfig.matcher),
-				plugin.PartitionLabelMatcherInstances(partDomain, partConfig.matcher, flags.config.DisableTopologyHints),
-			),
-			cancel,
-		)
+	registry, cleanup, err := startApp(appContext, appWaitGroup, devDiscovery, flags.config)
+	if err != nil {
+		klog.Fatalf("failed to start app: %v", err)
+		os.Exit(1)
 	}
-
-	for _, batchConfig := range flags.config.BatchPartitions {
-		batchDomain := batchConfig.DomainOverride
-		if batchDomain == "" {
-			batchDomain = domain
-		}
-		cancel = mux.ChainCancelFunc(
-			plugin.NewBatchPartitionScatter(
-				devDiscovery,
-				registry,
-				batchDomain,
-				batchConfig.Name,
-				batchConfig.matcher,
-				batchConfig.Count,
-			),
-			cancel,
-		)
-	}
-
-	for _, netBWConfig := range flags.config.NetworkBandwidth {
-		cancel = mux.ChainCancelFunc(
-			plugin.NewScatter(
-				devDiscovery,
-				registry,
-				plugin.NetBWMatcherTemplater(domain, netBWConfig.matcher),
-				plugin.NetBWMatcherInstances(domain, netBWConfig.matcher, netBWConfig.MbpsPerShare),
-			),
-			cancel,
-		)
-	}
-
-	for _, netRdmaConfig := range flags.config.NetworkRdma {
-		cancel = mux.ChainCancelFunc(
-			plugin.NewScatter(
-				devDiscovery,
-				registry,
-				plugin.NetRdmaMatcherTemplater(domain, netRdmaConfig.matcher),
-				plugin.NetRdmaMatcherInstances(domain, netRdmaConfig.matcher, int(netRdmaConfig.ResourceCount)),
-			),
-			cancel,
-		)
-	}
+	defer cleanup()
 
 	healthCheckAddr := fmt.Sprintf(":%d", flags.config.HealthCheckPort)
 	klog.Infof("Starting /healthz server on port %s", healthCheckAddr)
@@ -127,7 +66,6 @@ func main() {
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 	for signal := range sigs {
 		switch signal {
 		case syscall.SIGINT, syscall.SIGTERM:
@@ -135,6 +73,85 @@ func main() {
 			return
 		}
 	}
+}
+
+// startApp wires up the device plugin pipeline: creates a Registry, connects
+// Scatters for each configured resource type to the given discovery, and
+// returns the registry plus a cleanup function that tears down all scatters.
+func startApp(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	discovery udev.Discovery,
+	config *appConfig,
+	registryOpts ...plugin.RegistryOption,
+) (*plugin.Registry, mux.CancelFunc, error) {
+	registry, err := plugin.NewRegistry(ctx, wg, registryOpts...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create plugin registry: %w", err)
+	}
+
+	domain := config.DeviceDomain
+
+	cancel := mux.CancelFunc(func() {})
+	for _, partConfig := range config.Partitions {
+		partDomain := partConfig.DomainOverride
+		if partDomain == "" {
+			partDomain = domain
+		}
+		cancel = mux.ChainCancelFunc(
+			plugin.NewScatter(
+				discovery,
+				registry,
+				plugin.PartitionLabelMatcherTemplater(partDomain, partConfig.matcher),
+				plugin.PartitionLabelMatcherInstances(partDomain, partConfig.matcher, config.DisableTopologyHints),
+			),
+			cancel,
+		)
+	}
+
+	for _, batchConfig := range config.BatchPartitions {
+		batchDomain := batchConfig.DomainOverride
+		if batchDomain == "" {
+			batchDomain = domain
+		}
+		cancel = mux.ChainCancelFunc(
+			plugin.NewBatchPartitionScatter(
+				discovery,
+				registry,
+				batchDomain,
+				batchConfig.Name,
+				batchConfig.matcher,
+				batchConfig.Count,
+			),
+			cancel,
+		)
+	}
+
+	for _, netBWConfig := range config.NetworkBandwidth {
+		cancel = mux.ChainCancelFunc(
+			plugin.NewScatter(
+				discovery,
+				registry,
+				plugin.NetBWMatcherTemplater(domain, netBWConfig.matcher),
+				plugin.NetBWMatcherInstances(domain, netBWConfig.matcher, netBWConfig.MbpsPerShare),
+			),
+			cancel,
+		)
+	}
+
+	for _, netRdmaConfig := range config.NetworkRdma {
+		cancel = mux.ChainCancelFunc(
+			plugin.NewScatter(
+				discovery,
+				registry,
+				plugin.NetRdmaMatcherTemplater(domain, netRdmaConfig.matcher),
+				plugin.NetRdmaMatcherInstances(domain, netRdmaConfig.matcher, int(netRdmaConfig.ResourceCount)),
+			),
+			cancel,
+		)
+	}
+
+	return registry, cancel, nil
 }
 
 type configSource interface {
