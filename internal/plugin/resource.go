@@ -150,12 +150,6 @@ func (r *resource) snapshotLocked() []Instance {
 	return all
 }
 
-func (r *resource) snapshot() []Instance {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.snapshotLocked()
-}
-
 // ListAndWatch returns a channel that receives instance snapshots. Each call
 // creates an independent subscriber that first receives the current state and
 // then all subsequent updates. The subscription is cancelled when ctx is done.
