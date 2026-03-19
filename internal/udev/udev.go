@@ -222,6 +222,7 @@ func (s *udevSlice) Subscribe(sink mux.Sink[[]Device]) mux.CancelFunc {
 	case s.subscribeC <- subscribeReq{sink: sink, reply: replyCh}:
 		return <-replyCh
 	case <-s.done:
+		sink.Close()
 		return func() {}
 	}
 }

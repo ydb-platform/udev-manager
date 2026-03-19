@@ -82,6 +82,51 @@ var _ = Describe("resource", func() {
 			r.Close()
 			Eventually(ch).Should(BeClosed())
 		})
+
+		It("supports multiple concurrent subscribers", func() {
+			DeferCleanup(r.Close)
+			ctx2, cancel2 := context.WithCancel(context.Background())
+			defer cancel2()
+
+			ch1 := r.ListAndWatch(ctx)
+			ch2 := r.ListAndWatch(ctx2)
+
+			// Both subscribers receive the initial snapshot.
+			Eventually(ch1).Should(Receive(ContainElement(p)))
+			Eventually(ch2).Should(Receive(ContainElement(p)))
+
+			// Both receive subsequent updates.
+			r.Submit(HealthEvent{Instances: []Instance{p}, Health: Unhealthy{}})
+			Eventually(ch1).Should(Receive())
+			Eventually(ch2).Should(Receive())
+		})
+
+		It("cancelling one subscriber does not affect others", func() {
+			DeferCleanup(r.Close)
+			ctx1, cancel1 := context.WithCancel(context.Background())
+			ctx2, cancel2 := context.WithCancel(context.Background())
+			defer cancel2()
+
+			ch1 := r.ListAndWatch(ctx1)
+			ch2 := r.ListAndWatch(ctx2)
+
+			Eventually(ch1).Should(Receive()) // drain initial
+			Eventually(ch2).Should(Receive()) // drain initial
+
+			// Cancel first subscriber.
+			cancel1()
+			Eventually(ch1).Should(BeClosed())
+
+			// Second subscriber still receives updates.
+			r.Submit(HealthEvent{Instances: []Instance{p}, Health: Healthy{}})
+			Eventually(ch2).Should(Receive())
+		})
+
+		It("returns a closed channel when resource is already closed", func() {
+			r.Close()
+			ch := r.ListAndWatch(ctx)
+			Eventually(ch).Should(BeClosed())
+		})
 	})
 
 	Describe("Submit", func() {

@@ -94,24 +94,20 @@ type resource struct {
 	resourceTemplate ResourceTemplate
 	mu               sync.RWMutex
 	instances        map[Id]Instance
-	notify           chan struct{}
-	instanceCh       chan []Instance
+	broadcast        *mux.Mux[[]Instance]
 	done             chan struct{}
 	doneOnce         sync.Once
 }
 
-// newResource creates a resource and starts its internal goroutine eagerly.
-// This ensures Submit never blocks waiting for ListAndWatch to be called.
+// newResource creates a resource. Submit updates are broadcast to all
+// ListAndWatch subscribers via an internal mux.
 func newResource(template ResourceTemplate, instances map[Id]Instance) *resource {
-	r := &resource{
+	return &resource{
 		resourceTemplate: template,
 		instances:        instances,
-		notify:           make(chan struct{}, 1),
-		instanceCh:       make(chan []Instance, 1),
+		broadcast:        mux.Make[[]Instance](),
 		done:             make(chan struct{}),
 	}
-	go r.run()
-	return r
 }
 
 func (r *resource) Name() string {
@@ -119,7 +115,7 @@ func (r *resource) Name() string {
 }
 
 // Instances returns a snapshot copy of the current instance map.
-// Safe to call concurrently with run().
+// Safe to call concurrently with Submit.
 func (r *resource) Instances() map[Id]Instance {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -130,9 +126,8 @@ func (r *resource) Instances() map[Id]Instance {
 	return snapshot
 }
 
-// Submit updates instance health state and notifies the run loop.
-// Submit never blocks: if a notification is already pending, the update
-// is coalesced — run() will pick up the latest state when it drains.
+// Submit updates instance health state and broadcasts a snapshot to all
+// active ListAndWatch subscribers.
 func (r *resource) Submit(ev HealthEvent) error {
 	r.mu.Lock()
 	for _, instance := range ev.Instances {
@@ -141,19 +136,13 @@ func (r *resource) Submit(ev HealthEvent) error {
 			health:   ev.Health,
 		}
 	}
+	snapshot := r.snapshotLocked()
 	r.mu.Unlock()
 
-	select {
-	case r.notify <- struct{}{}:
-	case <-r.done:
-	default:
-	}
-	return nil
+	return r.broadcast.Submit(snapshot)
 }
 
-func (r *resource) snapshot() []Instance {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+func (r *resource) snapshotLocked() []Instance {
 	all := make([]Instance, 0, len(r.instances))
 	for _, inst := range r.instances {
 		all = append(all, inst)
@@ -161,37 +150,54 @@ func (r *resource) snapshot() []Instance {
 	return all
 }
 
-// run is the single goroutine that publishes instance snapshots to
-// instanceCh. It starts eagerly (via newResource) so that Submit
-// never blocks waiting for ListAndWatch to be called.
-func (r *resource) run() {
-	defer close(r.instanceCh)
+func (r *resource) snapshot() []Instance {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.snapshotLocked()
+}
+
+// ListAndWatch returns a channel that receives instance snapshots. Each call
+// creates an independent subscriber that first receives the current state and
+// then all subsequent updates. The subscription is cancelled when ctx is done.
+// Safe to call multiple times (e.g. on kubelet reconnect).
+func (r *resource) ListAndWatch(ctx context.Context) <-chan []Instance {
+	ch := make(chan []Instance, 2)
+
 	select {
-	case r.instanceCh <- r.snapshot():
 	case <-r.done:
-		return
+		close(ch)
+		return ch
+	default:
 	}
-	for {
+
+	sink := mux.SinkFromChan(ch)
+
+	// Hold RLock across subscribe + snapshot so that no Submit can
+	// interleave between the two operations. This guarantees the
+	// subscriber receives the replay snapshot before any future update.
+	r.mu.RLock()
+	cancel := r.broadcast.Subscribe(sink)
+	snapshot := r.snapshotLocked()
+	r.mu.RUnlock()
+
+	// Replay current state. Non-blocking because ch has capacity 2.
+	ch <- snapshot
+
+	go func() {
 		select {
-		case <-r.notify:
-			select {
-			case r.instanceCh <- r.snapshot():
-			case <-r.done:
-				return
-			}
+		case <-ctx.Done():
+			cancel()
 		case <-r.done:
-			return
 		}
-	}
+	}()
+
+	return ch
 }
 
-// ListAndWatch returns the channel fed by the resource's run loop.
-// It must be called at most once per resource lifetime.
-func (r *resource) ListAndWatch(_ context.Context) <-chan []Instance {
-	return r.instanceCh
-}
-
-// Close shuts down the resource's run loop and closes the instance channel.
+// Close shuts down the resource and closes all subscriber channels.
 func (r *resource) Close() {
-	r.doneOnce.Do(func() { close(r.done) })
+	r.doneOnce.Do(func() {
+		close(r.done)
+		r.broadcast.Close()
+	})
 }
