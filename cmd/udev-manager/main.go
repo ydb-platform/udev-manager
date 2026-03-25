@@ -316,9 +316,6 @@ func (bc *batchPartitionsConfig) validate() error {
 	if err != nil {
 		return fmt.Errorf(".matcher: %q must be a valid regexp: %w", bc.Matcher, err)
 	}
-	if matcher.NumSubexp() > 1 {
-		return fmt.Errorf(".matcher: %q must have at most one capturing group", bc.Matcher)
-	}
 	bc.matcher = matcher
 	if bc.Count < 0 {
 		return fmt.Errorf(".count: must be >= 0, got %d", bc.Count)
