@@ -20,7 +20,7 @@ var _ = Describe("matchBatchPartitionDevice", func() {
 
 	It("returns false for a non-block device", func() {
 		dev := netDevice("eth0", "1000", "up")
-		_, ok := matchBatchPartitionDevice(dev, matcher)
+		_, _, ok := matchBatchPartitionDevice(dev, matcher)
 		Expect(ok).To(BeFalse())
 	})
 
@@ -31,7 +31,7 @@ var _ = Describe("matchBatchPartitionDevice", func() {
 			devType:    "disk",
 			properties: map[string]string{},
 		}
-		_, ok := matchBatchPartitionDevice(dev, matcher)
+		_, _, ok := matchBatchPartitionDevice(dev, matcher)
 		Expect(ok).To(BeFalse())
 	})
 
@@ -42,21 +42,31 @@ var _ = Describe("matchBatchPartitionDevice", func() {
 			devType:    udev.DeviceTypePart,
 			properties: map[string]string{},
 		}
-		_, ok := matchBatchPartitionDevice(dev, matcher)
+		_, _, ok := matchBatchPartitionDevice(dev, matcher)
 		Expect(ok).To(BeFalse())
 	})
 
 	It("returns false when the label does not match the regexp", func() {
 		dev := partitionDevice("sda1", "data_01")
-		_, ok := matchBatchPartitionDevice(dev, matcher)
+		_, _, ok := matchBatchPartitionDevice(dev, matcher)
 		Expect(ok).To(BeFalse())
 	})
 
-	It("returns (device id, true) when the label matches", func() {
+	It("returns the full match as label when there is no capture group", func() {
 		dev := partitionDevice("nvme0n1p1", "nvme_data_01")
-		id, ok := matchBatchPartitionDevice(dev, matcher)
+		id, label, ok := matchBatchPartitionDevice(dev, matcher)
 		Expect(ok).To(BeTrue())
 		Expect(id).To(Equal(udev.Id("nvme0n1p1")))
+		Expect(label).To(Equal("nvme_data_01"))
+	})
+
+	It("returns capture group 1 as label when a capture group is present", func() {
+		m := regexp.MustCompile(`nvme_(.*)`)
+		dev := partitionDevice("nvme0n1p1", "nvme_data_01")
+		id, label, ok := matchBatchPartitionDevice(dev, m)
+		Expect(ok).To(BeTrue())
+		Expect(id).To(Equal(udev.Id("nvme0n1p1")))
+		Expect(label).To(Equal("data_01"))
 	})
 })
 
@@ -67,6 +77,7 @@ var _ = Describe("batchPartitionPool", func() {
 	BeforeEach(func() {
 		pool = &batchPartitionPool{
 			parts:  make(map[udev.Id]udev.Device),
+			labels: make(map[udev.Id]string),
 			domain: "ydb.tech",
 		}
 		dev1 = partitionDevice("nvme0n1p1", "nvme_data_01")
@@ -87,7 +98,7 @@ var _ = Describe("batchPartitionPool", func() {
 		})
 
 		It("returns Healthy when the pool has at least one device", func() {
-			pool.add(dev1)
+			pool.add(dev1, "nvme_data_01")
 			Expect(pool.health()).To(BeAssignableToTypeOf(Healthy{}))
 		})
 	})
@@ -98,12 +109,12 @@ var _ = Describe("batchPartitionPool", func() {
 		})
 
 		It("returns false after a device is added", func() {
-			pool.add(dev1)
+			pool.add(dev1, "nvme_data_01")
 			Expect(pool.empty()).To(BeFalse())
 		})
 
 		It("returns true again after the last device is removed", func() {
-			pool.add(dev1)
+			pool.add(dev1, "nvme_data_01")
 			pool.remove(dev1.Id())
 			Expect(pool.empty()).To(BeTrue())
 		})
@@ -111,19 +122,19 @@ var _ = Describe("batchPartitionPool", func() {
 
 	Describe("add and remove", func() {
 		It("increases pool size on add", func() {
-			pool.add(dev1)
+			pool.add(dev1, "nvme_data_01")
 			Expect(pool.parts).To(HaveLen(1))
 		})
 
 		It("adding the same device twice is idempotent", func() {
-			pool.add(dev1)
-			pool.add(dev1)
+			pool.add(dev1, "nvme_data_01")
+			pool.add(dev1, "nvme_data_01")
 			Expect(pool.parts).To(HaveLen(1))
 		})
 
 		It("removes only the specified device", func() {
-			pool.add(dev1)
-			pool.add(dev2)
+			pool.add(dev1, "nvme_data_01")
+			pool.add(dev2, "nvme_data_02")
 			pool.remove(dev1.Id())
 			Expect(pool.parts).To(HaveLen(1))
 			Expect(pool.parts).To(HaveKey(dev2.Id()))
@@ -139,7 +150,7 @@ var _ = Describe("batchPartitionPool", func() {
 		})
 
 		It("returns one device spec for a single device in the pool", func() {
-			pool.add(dev1)
+			pool.add(dev1, "nvme_data_01")
 			resp, err := pool.allocate(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.Devices).To(HaveLen(1))
@@ -148,15 +159,15 @@ var _ = Describe("batchPartitionPool", func() {
 		})
 
 		It("returns merged device specs for multiple devices", func() {
-			pool.add(dev1)
-			pool.add(dev2)
+			pool.add(dev1, "nvme_data_01")
+			pool.add(dev2, "nvme_data_02")
 			resp, err := pool.allocate(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.Devices).To(HaveLen(2))
 		})
 
 		It("sets env vars for each partition using the partition label", func() {
-			pool.add(dev1)
+			pool.add(dev1, "nvme_data_01")
 			resp, err := pool.allocate(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.Envs).To(HaveKey("YDB_TECH_PART_NVME_DATA_01_PATH"))
@@ -171,6 +182,7 @@ var _ = Describe("batchPartitionSeat", func() {
 	BeforeEach(func() {
 		pool = &batchPartitionPool{
 			parts:  make(map[udev.Id]udev.Device),
+			labels: make(map[udev.Id]string),
 			domain: "ydb.tech",
 		}
 		seat = &batchPartitionSeat{id: "0", pool: pool}
@@ -185,7 +197,7 @@ var _ = Describe("batchPartitionSeat", func() {
 	})
 
 	It("is Healthy when the pool has a device", func() {
-		pool.add(partitionDevice("nvme0n1p1", "nvme_data"))
+		pool.add(partitionDevice("nvme0n1p1", "nvme_data"), "nvme_data")
 		Expect(seat.Health()).To(BeAssignableToTypeOf(Healthy{}))
 	})
 
@@ -194,7 +206,7 @@ var _ = Describe("batchPartitionSeat", func() {
 	})
 
 	It("delegates Allocate to the pool", func() {
-		pool.add(partitionDevice("nvme0n1p1", "nvme_data"))
+		pool.add(partitionDevice("nvme0n1p1", "nvme_data"), "nvme_data")
 		resp, err := seat.Allocate(context.Background())
 		Expect(err).NotTo(HaveOccurred())
 		Expect(resp.Devices).To(HaveLen(1))
@@ -231,6 +243,7 @@ var _ = Describe("runBatchPartitionScatter", func() {
 		matcher = regexp.MustCompile(`nvme.*`)
 		pool = &batchPartitionPool{
 			parts:  make(map[udev.Id]udev.Device),
+			labels: make(map[udev.Id]string),
 			domain: "ydb.tech",
 		}
 		seat := &batchPartitionSeat{id: "0", pool: pool}
