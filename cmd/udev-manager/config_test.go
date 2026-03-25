@@ -173,9 +173,9 @@ var _ = Describe("batchPartitionsConfig.validate", func() {
 		Expect(bc.validate()).To(MatchError(ContainSubstring(".domain")))
 	})
 
-	It("allows multiple capture groups (unlike partitionsConfig)", func() {
+	It("rejects a matcher with more than one capture group", func() {
 		bc := &batchPartitionsConfig{Name: "nvme-set", Matcher: `nvme_(.*)_(.*)`}
-		Expect(bc.validate()).NotTo(HaveOccurred())
+		Expect(bc.validate()).To(MatchError(ContainSubstring(".matcher")))
 	})
 
 	It("compiles matcher so it can be used after validate", func() {

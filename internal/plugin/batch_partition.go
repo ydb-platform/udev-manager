@@ -18,6 +18,7 @@ import (
 type batchPartitionPool struct {
 	mu     sync.RWMutex
 	parts  map[udev.Id]udev.Device
+	labels map[udev.Id]string // mapped label per device (from capture group 1 or full PARTNAME)
 	domain string
 }
 
@@ -36,30 +37,35 @@ func (p *batchPartitionPool) empty() bool {
 	return len(p.parts) == 0
 }
 
-func (p *batchPartitionPool) add(dev udev.Device) {
+func (p *batchPartitionPool) add(dev udev.Device, label string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.parts[dev.Id()] = dev
+	p.labels[dev.Id()] = label
 }
 
 func (p *batchPartitionPool) remove(id udev.Id) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.parts, id)
+	delete(p.labels, id)
 }
 
 func (p *batchPartitionPool) allocate(ctx context.Context) (*pluginapi.ContainerAllocateResponse, error) {
 	p.mu.RLock()
-	snapshot := make([]udev.Device, 0, len(p.parts))
-	for _, dev := range p.parts {
-		snapshot = append(snapshot, dev)
+	type devLabel struct {
+		dev   udev.Device
+		label string
+	}
+	snapshot := make([]devLabel, 0, len(p.parts))
+	for id, dev := range p.parts {
+		snapshot = append(snapshot, devLabel{dev: dev, label: p.labels[id]})
 	}
 	p.mu.RUnlock()
 
 	responses := make([]*pluginapi.ContainerAllocateResponse, 0, len(snapshot))
-	for _, dev := range snapshot {
-		partlabel := dev.Properties()[udev.PropertyPartName]
-		responses = append(responses, allocatePartitionDevice(dev, p.domain, partlabel))
+	for _, dl := range snapshot {
+		responses = append(responses, allocatePartitionDevice(dl.dev, p.domain, dl.label))
 	}
 	return mergeResponses(responses...), nil
 }
@@ -82,22 +88,28 @@ func (s *batchPartitionSeat) Allocate(ctx context.Context) (*pluginapi.Container
 }
 
 // matchBatchPartitionDevice checks if a device is a partition matching the given regexp.
-// Returns the device's udev.Id and true if it matches, or zero value and false otherwise.
-func matchBatchPartitionDevice(dev udev.Device, matcher *regexp.Regexp) (udev.Id, bool) {
+// Returns the device's udev.Id, the mapped label (capture group 1 if present, otherwise
+// the full PARTNAME), and true if it matches, or zero values and false otherwise.
+func matchBatchPartitionDevice(dev udev.Device, matcher *regexp.Regexp) (udev.Id, string, bool) {
 	if dev.Subsystem() != udev.BlockSubsystem {
-		return "", false
+		return "", "", false
 	}
 	if dev.DevType() != udev.DeviceTypePart {
-		return "", false
+		return "", "", false
 	}
 	partlabel, found := dev.Properties()[udev.PropertyPartName]
 	if !found {
-		return "", false
+		return "", "", false
 	}
-	if !matcher.MatchString(partlabel) {
-		return "", false
+	matches := matcher.FindStringSubmatch(partlabel)
+	if len(matches) == 0 {
+		return "", "", false
 	}
-	return dev.Id(), true
+	label := matches[0]
+	if len(matches) > 1 {
+		label = matches[1]
+	}
+	return dev.Id(), label, true
 }
 
 // NewBatchPartitionScatter creates a batch partition resource that aggregates all partitions
@@ -113,6 +125,7 @@ func NewBatchPartitionScatter(
 ) mux.CancelFunc {
 	pool := &batchPartitionPool{
 		parts:  make(map[udev.Id]udev.Device),
+		labels: make(map[udev.Id]string),
 		domain: domain,
 	}
 
@@ -155,8 +168,8 @@ func runBatchPartitionScatter(
 		switch ev := ev.(type) {
 		case udev.Init:
 			for _, dev := range ev.Devices {
-				if id, ok := matchBatchPartitionDevice(dev, matcher); ok {
-					pool.add(dev)
+				if id, label, ok := matchBatchPartitionDevice(dev, matcher); ok {
+					pool.add(dev, label)
 					klog.V(5).Infof("batch %s: init matched partition %s", res.Name(), id)
 				}
 			}
@@ -167,12 +180,12 @@ func runBatchPartitionScatter(
 			}
 
 		case udev.Added:
-			id, ok := matchBatchPartitionDevice(ev.Device, matcher)
+			id, label, ok := matchBatchPartitionDevice(ev.Device, matcher)
 			if !ok {
 				continue
 			}
 			wasEmpty := pool.empty()
-			pool.add(ev.Device)
+			pool.add(ev.Device, label)
 			klog.V(5).Infof("batch %s: added partition %s", res.Name(), id)
 			if wasEmpty {
 				if err := res.Submit(HealthEvent{Instances: seats, Health: Healthy{}}); err != nil {
@@ -181,7 +194,7 @@ func runBatchPartitionScatter(
 			}
 
 		case udev.Removed:
-			id, ok := matchBatchPartitionDevice(ev.Device, matcher)
+			id, _, ok := matchBatchPartitionDevice(ev.Device, matcher)
 			if !ok {
 				continue
 			}
