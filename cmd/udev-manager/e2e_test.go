@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"net/http/httptest"
 	"os"
 	"sync"
@@ -746,6 +747,137 @@ partitions:
 			By("stream.Recv returns an error after shutdown")
 			_, err = stream.Recv()
 			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Describe("Two batch partitions splitting disks by capture group", func() {
+		// 17 disks, each with 4 partitions (disk 14 has 8).
+		// Split in half by disk number: batch-low gets 01-08, batch-high gets 09-16.
+		// Capture group 1 extracts "ssd_XX_YY" from "ydb_disk_ssd_XX_YY".
+		allLabels := []string{
+			"ydb_disk_ssd_01_01", "ydb_disk_ssd_01_02", "ydb_disk_ssd_01_03", "ydb_disk_ssd_01_04",
+			"ydb_disk_ssd_02_01", "ydb_disk_ssd_02_02", "ydb_disk_ssd_02_03", "ydb_disk_ssd_02_04",
+			"ydb_disk_ssd_03_01", "ydb_disk_ssd_03_02", "ydb_disk_ssd_03_03", "ydb_disk_ssd_03_04",
+			"ydb_disk_ssd_04_01", "ydb_disk_ssd_04_02", "ydb_disk_ssd_04_03", "ydb_disk_ssd_04_04",
+			"ydb_disk_ssd_05_01", "ydb_disk_ssd_05_02", "ydb_disk_ssd_05_03", "ydb_disk_ssd_05_04",
+			"ydb_disk_ssd_06_01", "ydb_disk_ssd_06_02", "ydb_disk_ssd_06_03", "ydb_disk_ssd_06_04",
+			"ydb_disk_ssd_07_01", "ydb_disk_ssd_07_02", "ydb_disk_ssd_07_03", "ydb_disk_ssd_07_04",
+			"ydb_disk_ssd_08_01", "ydb_disk_ssd_08_02", "ydb_disk_ssd_08_03", "ydb_disk_ssd_08_04",
+			"ydb_disk_ssd_09_01", "ydb_disk_ssd_09_02", "ydb_disk_ssd_09_03", "ydb_disk_ssd_09_04",
+			"ydb_disk_ssd_10_01", "ydb_disk_ssd_10_02", "ydb_disk_ssd_10_03", "ydb_disk_ssd_10_04",
+			"ydb_disk_ssd_11_01", "ydb_disk_ssd_11_02", "ydb_disk_ssd_11_03", "ydb_disk_ssd_11_04",
+			"ydb_disk_ssd_12_01", "ydb_disk_ssd_12_02", "ydb_disk_ssd_12_03", "ydb_disk_ssd_12_04",
+			"ydb_disk_ssd_13_01", "ydb_disk_ssd_13_02", "ydb_disk_ssd_13_03", "ydb_disk_ssd_13_04",
+			"ydb_disk_ssd_14_01", "ydb_disk_ssd_14_02", "ydb_disk_ssd_14_03", "ydb_disk_ssd_14_04",
+			"ydb_disk_ssd_14_05", "ydb_disk_ssd_14_06", "ydb_disk_ssd_14_07", "ydb_disk_ssd_14_08",
+			"ydb_disk_ssd_15_01", "ydb_disk_ssd_15_02", "ydb_disk_ssd_15_03", "ydb_disk_ssd_15_04",
+			"ydb_disk_ssd_16_01", "ydb_disk_ssd_16_02", "ydb_disk_ssd_16_03", "ydb_disk_ssd_16_04",
+		}
+
+		It("each batch collects its own subset and uses capture group 1 as label", func() {
+			for i, label := range allLabels {
+				id := fmt.Sprintf("/sys/block/ssd%d/ssd%dp1", i, i)
+				devNode := fmt.Sprintf("/dev/ssd%dp1", i)
+				discovery.AddDevice(makePartitionDevice(id, devNode, label))
+			}
+
+			config := mustParseYAML(`
+domain: ydb.tech
+batchPartitions:
+  - name: low
+    matcher: "ydb_disk_(ssd_0[1-8]_\\d+)"
+    count: 1
+  - name: high
+    matcher: "ydb_disk_(ssd_(?:09|1[0-6])_\\d+)"
+    count: 1
+`)
+
+			startTestApp(ctx, wg, discovery, config, tmpDir, kubeSock)
+
+			By("waiting for two batch registrations")
+			waitForRegistrations(kubelet, 2)
+
+			names := make([]string, 2)
+			for i, r := range kubelet.Registrations() {
+				names[i] = r.ResourceName
+			}
+			Expect(names).To(ContainElements("ydb.tech/batch-low", "ydb.tech/batch-high"))
+
+			By("connecting to each socket and allocating")
+			var sockets []string
+			Eventually(func() []string {
+				sockets = findPluginSockets(tmpDir)
+				return sockets
+			}, 5*time.Second, 50*time.Millisecond).Should(HaveLen(2))
+
+			// Map resource name → socket by socket filename.
+			sockByName := map[string]string{}
+			for _, s := range sockets {
+				name := filepath.Base(s)
+				if name == "ydb-tech-batch-low.sock" {
+					sockByName["low"] = s
+				} else if name == "ydb-tech-batch-high.sock" {
+					sockByName["high"] = s
+				}
+			}
+			Expect(sockByName).To(HaveLen(2))
+
+			// batch-low: disks 01-08 → 32 partitions
+			clientLow, connLow := dialPlugin(sockByName["low"])
+			DeferCleanup(func() { connLow.Close() })
+
+			streamLow, err := clientLow.ListAndWatch(ctx, &pluginapi.Empty{})
+			Expect(err).NotTo(HaveOccurred())
+			respLow := recvWithTimeout(streamLow, 5*time.Second)
+			Expect(respLow.Devices).To(HaveLen(1))
+			Expect(respLow.Devices[0].Health).To(Equal("Healthy"))
+
+			allocLow, err := clientLow.Allocate(ctx, &pluginapi.AllocateRequest{
+				ContainerRequests: []*pluginapi.ContainerAllocateRequest{
+					{DevicesIDs: []string{"0"}},
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			crLow := allocLow.ContainerResponses[0]
+			Expect(crLow.Devices).To(HaveLen(32))
+
+			By("verifying batch-low labels use capture group 1 (ssd_XX_YY, not ydb_disk_ssd_XX_YY)")
+			for _, d := range crLow.Devices {
+				Expect(d.ContainerPath).To(HavePrefix("/dev/allocated/ydb.tech/part/ssd_0"))
+			}
+			Expect(crLow.Envs).To(HaveKey("YDB_TECH_PART_SSD_01_01_PATH"))
+			Expect(crLow.Envs).To(HaveKey("YDB_TECH_PART_SSD_08_04_PATH"))
+			Expect(crLow.Envs).NotTo(HaveKey("YDB_TECH_PART_SSD_09_01_PATH"))
+
+			// batch-high: disks 09-16 → 36 partitions (disk 14 has 8)
+			clientHigh, connHigh := dialPlugin(sockByName["high"])
+			DeferCleanup(func() { connHigh.Close() })
+
+			streamHigh, err := clientHigh.ListAndWatch(ctx, &pluginapi.Empty{})
+			Expect(err).NotTo(HaveOccurred())
+			respHigh := recvWithTimeout(streamHigh, 5*time.Second)
+			Expect(respHigh.Devices).To(HaveLen(1))
+			Expect(respHigh.Devices[0].Health).To(Equal("Healthy"))
+
+			allocHigh, err := clientHigh.Allocate(ctx, &pluginapi.AllocateRequest{
+				ContainerRequests: []*pluginapi.ContainerAllocateRequest{
+					{DevicesIDs: []string{"0"}},
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			crHigh := allocHigh.ContainerResponses[0]
+			Expect(crHigh.Devices).To(HaveLen(36))
+
+			By("verifying batch-high labels use capture group 1")
+			Expect(crHigh.Envs).To(HaveKey("YDB_TECH_PART_SSD_09_01_PATH"))
+			Expect(crHigh.Envs).To(HaveKey("YDB_TECH_PART_SSD_14_05_PATH"))
+			Expect(crHigh.Envs).To(HaveKey("YDB_TECH_PART_SSD_16_04_PATH"))
+			Expect(crHigh.Envs).NotTo(HaveKey("YDB_TECH_PART_SSD_08_01_PATH"))
+
+			By("verifying no overlap between the two batches")
+			for key := range crLow.Envs {
+				Expect(crHigh.Envs).NotTo(HaveKey(key))
+			}
 		})
 	})
 })
