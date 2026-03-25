@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"path/filepath"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -813,10 +813,10 @@ batchPartitions:
 			// Map resource name → socket by socket filename.
 			sockByName := map[string]string{}
 			for _, s := range sockets {
-				name := filepath.Base(s)
-				if name == "ydb-tech-batch-low.sock" {
+				switch filepath.Base(s) {
+				case "ydb-tech-batch-low.sock":
 					sockByName["low"] = s
-				} else if name == "ydb-tech-batch-high.sock" {
+				case "ydb-tech-batch-high.sock":
 					sockByName["high"] = s
 				}
 			}
