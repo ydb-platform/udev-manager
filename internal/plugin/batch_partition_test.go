@@ -331,6 +331,28 @@ var _ = Describe("runBatchPartitionScatter", func() {
 		})
 	})
 
+	// Regression: udevDiscovery has a TOCTOU between NewEnumerate and
+	// NewMonitorFromNetlink. A device added in that gap is never recorded
+	// in state, so its later removal produces Removed{nil}.
+	Describe("nil device from TOCTOU gap", func() {
+		It("does not panic on Added with nil device", func() {
+			evCh <- udev.Added{Device: nil}
+			// Fence: send a valid event afterward and wait for it to be processed,
+			// proving the nil event was handled without crashing.
+			dev := partitionDevice("nvme0n1p1", "nvme_data_01")
+			evCh <- udev.Added{Device: dev}
+			Eventually(func() bool { return !pool.empty() }).Should(BeTrue())
+		})
+
+		It("does not panic on Removed with nil device", func() {
+			evCh <- udev.Removed{Device: nil}
+			// Fence: send a valid event afterward and wait for it to be processed.
+			dev := partitionDevice("nvme0n1p1", "nvme_data_01")
+			evCh <- udev.Added{Device: dev}
+			Eventually(func() bool { return !pool.empty() }).Should(BeTrue())
+		})
+	})
+
 	Describe("Removed event", func() {
 		BeforeEach(func() {
 			// Seed the pool with one matching device.

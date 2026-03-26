@@ -13,6 +13,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
@@ -79,11 +80,30 @@ func startFakeKubelet(dir string) (*fakeKubelet, string) {
 // socketPath and returns a DevicePluginClient. Fails the current Ginkgo test
 // on error. The caller must close the returned connection when done.
 func dialPlugin(socketPath string) (pluginapi.DevicePluginClient, *grpc.ClientConn) {
-	conn, err := grpc.NewClient(
-		"unix://"+socketPath,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	Expect(err).NotTo(HaveOccurred(), "dialPlugin")
+	var conn *grpc.ClientConn
+	EventuallyWithOffset(1, func() error {
+		var err error
+		conn, err = grpc.NewClient(
+			"unix://"+socketPath,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			return err
+		}
+		// Verify the server is actually accepting by making a quick health-style call.
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		conn.Connect()
+		state := conn.GetState()
+		if state != connectivity.Ready {
+			conn.WaitForStateChange(ctx, state)
+		}
+		if conn.GetState() != connectivity.Ready {
+			conn.Close()
+			return fmt.Errorf("server not ready at %s", socketPath)
+		}
+		return nil
+	}, 5*time.Second, 50*time.Millisecond).Should(Succeed(), "dialPlugin")
 	return pluginapi.NewDevicePluginClient(conn), conn
 }
 

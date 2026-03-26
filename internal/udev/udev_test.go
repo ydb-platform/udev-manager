@@ -145,6 +145,107 @@ var _ = Describe("FakeDevice", func() {
 })
 
 // ---------------------------------------------------------------------------
+// FakeDiscovery — parent linkage through Init
+// ---------------------------------------------------------------------------
+
+var _ = Describe("FakeDiscovery parent linkage", func() {
+	var d *udev.FakeDiscovery
+
+	BeforeEach(func() {
+		d = udev.NewFakeDiscovery()
+	})
+
+	AfterEach(func() {
+		d.Close()
+	})
+
+	// In production, udev_enumerate_scan_devices returns devices sorted in
+	// dependency order (parents before children). The enumeration loop in
+	// monitor() relies on this to resolve parent references from d.state.
+	// This test verifies that the parent relationship survives Init delivery.
+	It("delivers child devices with their parent reference intact", func() {
+		parent := udev.NewFakeDevice("sysfs/nvme0").
+			WithSubsystem(udev.BlockSubsystem).
+			WithDevType("disk").
+			WithDevNode("/dev/nvme0")
+		child := udev.NewFakeDevice("sysfs/nvme0n1p1").
+			WithSubsystem(udev.BlockSubsystem).
+			WithDevType(udev.DeviceTypePart).
+			WithDevNode("/dev/nvme0n1p1").
+			WithParent(parent)
+
+		// Add parent first, then child — mirrors libudev dependency order.
+		d.AddDevice(parent)
+		d.AddDevice(child)
+
+		ch := make(chan udev.Event, 4)
+		cancel := d.Subscribe(mux.SinkFromChan(ch))
+		defer cancel()
+
+		var initEvt udev.Event
+		Eventually(ch).Should(Receive(&initEvt))
+
+		devices := initEvt.(udev.Init).Devices
+		Expect(devices).To(HaveLen(2))
+
+		// Find the child in the Init snapshot and verify its parent.
+		var found udev.Device
+		for _, dev := range devices {
+			if dev.Id() == "sysfs/nvme0n1p1" {
+				found = dev
+			}
+		}
+		Expect(found).NotTo(BeNil())
+		Expect(found.Parent()).NotTo(BeNil())
+		Expect(found.Parent().Id()).To(Equal(udev.Id("sysfs/nvme0")))
+	})
+
+	It("child Parent() returns nil when parent was not added", func() {
+		// Simulates a broken dependency order or missing parent.
+		child := udev.NewFakeDevice("sysfs/nvme0n1p1").
+			WithSubsystem(udev.BlockSubsystem).
+			WithDevType(udev.DeviceTypePart)
+
+		d.AddDevice(child)
+
+		ch := make(chan udev.Event, 4)
+		cancel := d.Subscribe(mux.SinkFromChan(ch))
+		defer cancel()
+
+		var initEvt udev.Event
+		Eventually(ch).Should(Receive(&initEvt))
+
+		devices := initEvt.(udev.Init).Devices
+		Expect(devices).To(HaveLen(1))
+		Expect(devices[0].Parent()).To(BeNil())
+	})
+
+	// In production, generic.Parent() lazily resolves via DeviceById when
+	// the eager parent assignment during enumeration yields nil (e.g. if a
+	// child were enumerated before its parent). This test verifies that
+	// DeviceById returns the parent once it has been added, which is the
+	// contract the lazy resolution depends on.
+	It("resolves parent via DeviceById when child is added first", func() {
+		parent := udev.NewFakeDevice("sysfs/nvme0").
+			WithSubsystem(udev.BlockSubsystem).
+			WithDevType("disk").
+			WithDevNode("/dev/nvme0")
+		child := udev.NewFakeDevice("sysfs/nvme0n1p1").
+			WithSubsystem(udev.BlockSubsystem).
+			WithDevType(udev.DeviceTypePart).
+			WithDevNode("/dev/nvme0n1p1")
+
+		// Add child first — parent is not yet in state.
+		d.AddDevice(child)
+		Expect(d.DeviceById("sysfs/nvme0")).To(BeNil())
+
+		// Add parent afterward.
+		d.AddDevice(parent)
+		Expect(d.DeviceById("sysfs/nvme0")).To(Equal(parent))
+	})
+})
+
+// ---------------------------------------------------------------------------
 // FakeDiscovery — Subscribe
 // ---------------------------------------------------------------------------
 

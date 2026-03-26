@@ -70,4 +70,17 @@ var _ = Describe("Scatter", func() {
 			Consistently(watchCh, 50*time.Millisecond).ShouldNot(Receive())
 		})
 	})
+
+	// Regression: udevDiscovery has a TOCTOU between NewEnumerate and
+	// NewMonitorFromNetlink. A device added in that gap is never recorded
+	// in state, so its later removal produces Removed{nil}.
+	Describe("nil device from TOCTOU gap", func() {
+		It("does not panic when added receives a nil device", func() {
+			Expect(func() { scatter.added(nil) }).NotTo(Panic())
+		})
+
+		It("does not panic when removed receives a nil device", func() {
+			Expect(func() { scatter.removed(nil) }).NotTo(Panic())
+		})
+	})
 })
