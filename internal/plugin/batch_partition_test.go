@@ -24,6 +24,11 @@ var _ = Describe("matchBatchPartitionDevice", func() {
 		Expect(ok).To(BeFalse())
 	})
 
+	It("returns false for a nil device", func() {
+		_, _, ok := matchBatchPartitionDevice(nil, matcher)
+		Expect(ok).To(BeFalse())
+	})
+
 	It("returns false for a block disk (not a partition)", func() {
 		dev := &mockDevice{
 			id:         udev.Id("sda"),
@@ -366,6 +371,12 @@ var _ = Describe("runBatchPartitionScatter", func() {
 		It("ignores Removed events for non-matching devices", func() {
 			dev := partitionDevice("sda1", "data_01")
 			evCh <- udev.Removed{Device: dev}
+			Consistently(watchCh, 50*time.Millisecond).ShouldNot(Receive())
+		})
+
+		It("ignores Removed events with a nil device", func() {
+			evCh <- udev.Removed{}
+			Consistently(func() bool { return pool.empty() }, 50*time.Millisecond).Should(BeFalse())
 			Consistently(watchCh, 50*time.Millisecond).ShouldNot(Receive())
 		})
 	})
