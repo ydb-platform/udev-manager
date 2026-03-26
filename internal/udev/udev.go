@@ -77,10 +77,8 @@ func (g *generic) Id() Id {
 
 func (g *generic) Parent() Device {
 	g.parentOnce.Do(func() {
-		if g.parent == nil {
-			if p := g.dev.Parent(); p != nil {
-				g.parent = g.udev.DeviceById(Id(p.Syspath()))
-			}
+		if p := g.dev.Parent(); p != nil {
+			g.parent = &generic{udev: g.udev, dev: p}
 		}
 	})
 	return g.parent
@@ -237,9 +235,10 @@ type udevDiscovery struct {
 	done     chan struct{} // closed when monitor exits
 }
 
-// NewDiscovery creates a real udev-backed Discovery. It enumerates all
-// currently present devices and starts a monitor goroutine that publishes
-// Added and Removed events as the kernel reports them.
+// NewDiscovery creates a real udev-backed Discovery. It starts a monitor
+// goroutine that opens the netlink socket, enumerates current devices, and
+// then processes events. The socket is opened before enumeration so the
+// kernel buffers events during the scan, eliminating the TOCTOU window.
 func NewDiscovery(wg *sync.WaitGroup) (Discovery, error) {
 	d := &udevDiscovery{
 		state:    make(map[Id]Device),
@@ -247,29 +246,6 @@ func NewDiscovery(wg *sync.WaitGroup) (Discovery, error) {
 		mux:      mux.Make[Event](),
 		wg:       wg,
 		done:     make(chan struct{}),
-	}
-	enum := d.udev.NewEnumerate()
-
-	devs, err := enum.Devices()
-	if err != nil {
-		klog.Errorf("Failed to enumerate devices: %v", err)
-		return nil, err
-	}
-
-	for _, dev := range devs {
-		if dev == nil {
-			klog.Error("udev device is nil!")
-			continue
-		}
-		device := &generic{
-			udev: d,
-			dev:  dev,
-		}
-		if dev.Parent() != nil {
-			device.parent = d.state[Id(dev.Parent().Syspath())]
-		}
-
-		d.state[Id(dev.Syspath())] = device
 	}
 
 	wg.Add(1)
@@ -406,6 +382,7 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 	defer d.mux.Close()
 	defer close(d.done)
 
+	// Step 1: open the monitor socket so the kernel starts buffering events.
 	mon := d.udev.NewMonitorFromNetlink("udev")
 	devChan, errChan, err := mon.DeviceChan(context.Background())
 	if err != nil {
@@ -413,6 +390,28 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 		return
 	}
 
+	// Step 2: enumerate current devices while events buffer in devChan.
+	enum := d.udev.NewEnumerate()
+	devs, err := enum.Devices()
+	if err != nil {
+		klog.Errorf("Failed to enumerate devices: %v", err)
+		return
+	}
+
+	d.mu.Lock()
+	for _, dev := range devs {
+		if dev == nil {
+			klog.Error("udev device is nil!")
+			continue
+		}
+		d.state[Id(dev.Syspath())] = &generic{
+			udev: d,
+			dev:  dev,
+		}
+	}
+	d.mu.Unlock()
+
+	// Step 3: process buffered and future events.
 	for {
 		select {
 		case dev := <-devChan:
@@ -433,9 +432,13 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 			case ActionRemove, ActionOffline:
 				id := Id(dev.Syspath())
 				d.mu.Lock()
-				dev := d.state[id]
+				dev, ok := d.state[id]
 				delete(d.state, id)
 				d.mu.Unlock()
+				if !ok {
+					klog.V(5).Infof("udev: ignoring Remove for unknown device %s", id)
+					continue
+				}
 				if err := d.mux.Submit(Removed{dev}); err != nil {
 					klog.Errorf("udev: failed to submit Removed event: %v", err)
 				}

@@ -44,7 +44,6 @@ func (s *Scatter[T]) added(dev udev.Device) {
 		klog.Errorf("device is nil")
 		return
 	}
-
 	template, err := s.templater(dev)
 	if err != nil {
 		klog.Errorf("failed to create resource template for device %q, caused by %q", dev.Debug(), err.Error())
@@ -95,7 +94,6 @@ func (s *Scatter[T]) removed(dev udev.Device) {
 		klog.Errorf("device is nil")
 		return
 	}
-
 	template, err := s.templater(dev)
 	if err != nil {
 		klog.Errorf("failed to create resource template for 'Removed' event for device %q, caused by %q", dev.Debug(), err.Error())

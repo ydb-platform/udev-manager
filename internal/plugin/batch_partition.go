@@ -91,6 +91,9 @@ func (s *batchPartitionSeat) Allocate(ctx context.Context) (*pluginapi.Container
 // Returns the device's udev.Id, the mapped label (capture group 1 if present, otherwise
 // the full PARTNAME), and true if it matches, or zero values and false otherwise.
 func matchBatchPartitionDevice(dev udev.Device, matcher *regexp.Regexp) (udev.Id, string, bool) {
+	if dev == nil {
+		return "", "", false
+	}
 	if dev.Subsystem() != udev.BlockSubsystem {
 		return "", "", false
 	}
