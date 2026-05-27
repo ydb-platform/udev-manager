@@ -219,6 +219,50 @@ var _ = Describe("netRdmaConfig.validate", func() {
 	})
 })
 
+var _ = Describe("numaAffinityConfig.validate", func() {
+	It("accepts a minimal valid config", func() {
+		nac := &numaAffinityConfig{Name: "gpu-numa0", NumaNode: 0}
+		Expect(nac.validate()).NotTo(HaveOccurred())
+	})
+
+	It("rejects an empty name", func() {
+		nac := &numaAffinityConfig{Name: "", NumaNode: 0}
+		Expect(nac.validate()).To(MatchError(ContainSubstring(".name")))
+	})
+
+	It("rejects a negative numaNode", func() {
+		nac := &numaAffinityConfig{Name: "gpu", NumaNode: -1}
+		Expect(nac.validate()).To(MatchError(ContainSubstring(".numaNode")))
+	})
+
+	It("defaults count to 1 when not set", func() {
+		nac := &numaAffinityConfig{Name: "gpu", NumaNode: 1}
+		Expect(nac.validate()).NotTo(HaveOccurred())
+		Expect(nac.Count).To(Equal(1))
+	})
+
+	It("preserves an explicit count", func() {
+		nac := &numaAffinityConfig{Name: "gpu", NumaNode: 1, Count: 4}
+		Expect(nac.validate()).NotTo(HaveOccurred())
+		Expect(nac.Count).To(Equal(4))
+	})
+
+	It("rejects a negative count", func() {
+		nac := &numaAffinityConfig{Name: "gpu", NumaNode: 1, Count: -1}
+		Expect(nac.validate()).To(MatchError(ContainSubstring(".count")))
+	})
+
+	It("accepts a valid domain override", func() {
+		nac := &numaAffinityConfig{Name: "gpu", NumaNode: 1, DomainOverride: "storage.example.com"}
+		Expect(nac.validate()).NotTo(HaveOccurred())
+	})
+
+	It("rejects an invalid domain override", func() {
+		nac := &numaAffinityConfig{Name: "gpu", NumaNode: 1, DomainOverride: "bad domain"}
+		Expect(nac.validate()).To(MatchError(ContainSubstring(".domain")))
+	})
+})
+
 var _ = Describe("hostDevConfig.validate", func() {
 	It("accepts a valid matcher", func() {
 		hc := &hostDevConfig{Matcher: `/dev/sda.*`, Prefix: "sda"}
@@ -288,6 +332,23 @@ networkRdma:
 		Expect(cfg.NetworkRdma[0].matcher).NotTo(BeNil())
 	})
 
+	It("parses numaAffinity section", func() {
+		cfg := mustParseYAML(`
+domain: ydb.tech
+numaAffinity:
+  - name: gpu-numa0
+    numaNode: 0
+    count: 4
+  - name: gpu-numa1
+    numaNode: 1
+`)
+		Expect(cfg.NumaAffinity).To(HaveLen(2))
+		Expect(cfg.NumaAffinity[0].Name).To(Equal("gpu-numa0"))
+		Expect(cfg.NumaAffinity[0].NumaNode).To(Equal(0))
+		Expect(cfg.NumaAffinity[0].Count).To(Equal(4))
+		Expect(cfg.NumaAffinity[1].Count).To(Equal(1)) // defaulted
+	})
+
 	It("reports errors for each invalid section with its index", func() {
 		_, err := parseYAML(`
 domain: ydb.tech
@@ -300,11 +361,15 @@ networkBandwidth:
   - matcher: "["
 networkRdma:
   - matcher: "["
+numaAffinity:
+  - name: ""
+    numaNode: -1
 `)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring(".partitions[0]"))
 		Expect(err.Error()).To(ContainSubstring(".batchPartitions[0]"))
 		Expect(err.Error()).To(ContainSubstring(".networkBandwidth[0]"))
 		Expect(err.Error()).To(ContainSubstring(".networkRdma[0]"))
+		Expect(err.Error()).To(ContainSubstring(".numaAffinity[0]"))
 	})
 })

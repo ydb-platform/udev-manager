@@ -472,6 +472,82 @@ networkBandwidth:
 		})
 	})
 
+	Describe("Numa affinity", func() {
+		It("registers a static resource with healthy devices reporting the configured NUMA node", func() {
+			config := mustParseYAML(`
+domain: ydb.tech
+numaAffinity:
+  - name: gpu-numa1
+    numaNode: 1
+    count: 4
+`)
+
+			startTestApp(ctx, wg, discovery, config, tmpDir, kubeSock)
+
+			By("waiting for one registration (no udev device required)")
+			waitForRegistrations(kubelet, 1)
+			reg := kubelet.Registrations()[0]
+			Expect(reg.ResourceName).To(Equal("ydb.tech/numa-gpu-numa1"))
+
+			By("connecting and verifying 4 healthy devices, each with the NUMA hint")
+			sockets := waitForSockets(tmpDir)
+			client, conn := dialPlugin(sockets[0])
+			DeferCleanup(func() { conn.Close() })
+
+			stream, err := client.ListAndWatch(ctx, &pluginapi.Empty{})
+			Expect(err).NotTo(HaveOccurred())
+
+			resp := recvWithTimeout(stream, 5*time.Second)
+			Expect(resp.Devices).To(HaveLen(4))
+			for _, d := range resp.Devices {
+				Expect(d.Health).To(Equal("Healthy"))
+				Expect(d.Topology).NotTo(BeNil())
+				Expect(d.Topology.Nodes).To(HaveLen(1))
+				Expect(d.Topology.Nodes[0].ID).To(BeEquivalentTo(1))
+			}
+
+			By("allocating a device returns an empty response (affinity only)")
+			allocResp, err := client.Allocate(ctx, &pluginapi.AllocateRequest{
+				ContainerRequests: []*pluginapi.ContainerAllocateRequest{
+					{DevicesIDs: []string{"0"}},
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(allocResp.ContainerResponses).To(HaveLen(1))
+			Expect(allocResp.ContainerResponses[0].Devices).To(BeEmpty())
+			Expect(allocResp.ContainerResponses[0].Mounts).To(BeEmpty())
+			Expect(allocResp.ContainerResponses[0].Envs).To(BeEmpty())
+		})
+
+		It("defaults to a single device and honors the domain override", func() {
+			config := mustParseYAML(`
+domain: ydb.tech
+numaAffinity:
+  - name: numa0
+    numaNode: 0
+    domain: accel.example.com
+`)
+
+			startTestApp(ctx, wg, discovery, config, tmpDir, kubeSock)
+
+			waitForRegistrations(kubelet, 1)
+			reg := kubelet.Registrations()[0]
+			Expect(reg.ResourceName).To(Equal("accel.example.com/numa-numa0"))
+
+			sockets := waitForSockets(tmpDir)
+			client, conn := dialPlugin(sockets[0])
+			DeferCleanup(func() { conn.Close() })
+
+			stream, err := client.ListAndWatch(ctx, &pluginapi.Empty{})
+			Expect(err).NotTo(HaveOccurred())
+
+			resp := recvWithTimeout(stream, 5*time.Second)
+			Expect(resp.Devices).To(HaveLen(1))
+			Expect(resp.Devices[0].ID).To(Equal("0"))
+			Expect(resp.Devices[0].Topology.Nodes[0].ID).To(BeEquivalentTo(0))
+		})
+	})
+
 	Describe("Multiple resource types", func() {
 		It("registers independent resources from one config", func() {
 			partDev := makePartitionDevice("/sys/block/nvme0n1/nvme0n1p1", "/dev/nvme0n1p1", "nvme_disk01")
