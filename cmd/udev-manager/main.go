@@ -151,6 +151,24 @@ func startApp(
 		)
 	}
 
+	// numaAffinity resources are static and udev-independent: register them
+	// directly with the registry rather than wiring a discovery scatter.
+	for _, numaConfig := range config.NumaAffinity {
+		numaDomain := numaConfig.DomainOverride
+		if numaDomain == "" {
+			numaDomain = domain
+		}
+		if err := plugin.NewNumaAffinityResource(
+			registry,
+			numaDomain,
+			numaConfig.Name,
+			numaConfig.NumaNode,
+			numaConfig.Count,
+		); err != nil {
+			klog.Errorf("failed to create numa affinity resource %q: %v", numaConfig.Name, err)
+		}
+	}
+
 	return registry, cancel, nil
 }
 
@@ -377,6 +395,37 @@ func (nrc *netRdmaConfig) validate() error {
 	return nil
 }
 
+// numaAffinityConfig declares a statically-provided resource that fakes NUMA
+// affinity. Unlike the other resource types it is not backed by udev: the
+// devices are created purely from configuration.
+type numaAffinityConfig struct {
+	Name           string `yaml:"name"`            // resource name suffix: {domain}/numa-{name}
+	NumaNode       int    `yaml:"numaNode"`        // NUMA node the devices report affinity to
+	Count          int    `yaml:"count,omitempty"` // number of devices; default 1
+	DomainOverride string `yaml:"domain,omitempty"`
+}
+
+func (nac *numaAffinityConfig) validate() error {
+	if nac.Name == "" {
+		return fmt.Errorf(".name: must not be empty")
+	}
+	if nac.DomainOverride != "" {
+		if !deviceDomainRegex.MatchString(nac.DomainOverride) {
+			return fmt.Errorf(".domain: %q must be a valid domain name", nac.DomainOverride)
+		}
+	}
+	if nac.NumaNode < 0 {
+		return fmt.Errorf(".numaNode: must be >= 0, got %d", nac.NumaNode)
+	}
+	if nac.Count < 0 {
+		return fmt.Errorf(".count: must be >= 0, got %d", nac.Count)
+	}
+	if nac.Count == 0 {
+		nac.Count = 1
+	}
+	return nil
+}
+
 type appConfig struct {
 	DeviceDomain         string                  `yaml:"domain"`
 	DisableTopologyHints bool                    `yaml:"disable_topology_hints"`
@@ -386,6 +435,7 @@ type appConfig struct {
 	HostDevs             []hostDevConfig         `yaml:"hostdevs"`
 	NetworkBandwidth     []netBWConfig           `yaml:"networkBandwidth"`
 	NetworkRdma          []netRdmaConfig         `yaml:"networkRdma"`
+	NumaAffinity         []numaAffinityConfig    `yaml:"numaAffinity"`
 }
 
 func (c *appConfig) validate() error {
@@ -433,6 +483,13 @@ func (c *appConfig) validate() error {
 	for i := range c.NetworkRdma {
 		if err := c.NetworkRdma[i].validate(); err != nil {
 			errs = errors.Join(errs, fmt.Errorf(".networkRdma[%d]: %w", i, err))
+		}
+	}
+
+	// Validate numa affinity
+	for i := range c.NumaAffinity {
+		if err := c.NumaAffinity[i].validate(); err != nil {
+			errs = errors.Join(errs, fmt.Errorf(".numaAffinity[%d]: %w", i, err))
 		}
 	}
 

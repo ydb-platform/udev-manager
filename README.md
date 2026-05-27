@@ -45,6 +45,7 @@ The binary accepts a `--config` flag with one of:
 | `batchPartitions` | list | Group matching partitions into a single resource. |
 | `networkBandwidth` | list | Expose network bandwidth shares as resources. |
 | `networkRdma` | list | Expose RDMA device resources. |
+| `numaAffinity` | list | Expose statically-configured resources that fake NUMA affinity. |
 
 ### Partitions
 
@@ -88,6 +89,20 @@ Exposes RDMA character devices for a network interface.
 networkRdma:
   - matcher: '(^ib0$)'
     resourceCount: 4
+```
+
+### Numa affinity
+
+Exposes statically-configured resources that exist purely to fake NUMA affinity. Unlike the other types these resources are **not** backed by udev: the devices are created directly from configuration and are always healthy. Each device advertises a NUMA topology hint for the configured node, so the kubelet topology manager co-locates a requesting pod with that node. Allocating one mounts nothing and sets no env vars.
+
+```yaml
+numaAffinity:
+  - name: node0              # resource: {domain}/numa-node0
+    numaNode: 0              # NUMA node the devices report affinity to
+    count: 4                 # number of devices (default 1)
+  - name: node1
+    numaNode: 1              # count defaults to 1
+    domain: accel.example.com  # optional domain override
 ```
 
 ## Development

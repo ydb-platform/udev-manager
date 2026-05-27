@@ -1,0 +1,32 @@
+domain: 'ydb.tech'
+
+# numaAffinity declares statically-provided resources that exist purely to fake
+# NUMA affinity. Unlike the other resource types, these devices are NOT backed
+# by udev — they are created directly from this configuration and are always
+# healthy.
+#
+# Each device advertises a NUMA topology hint for the configured node, so the
+# kubelet's topology manager co-locates a requesting pod with that NUMA node.
+# Allocating one mounts nothing and sets no environment variables.
+#
+# Each entry creates one resource:
+#   ydb.tech/numa-<name>
+#
+# 'count' controls how many devices the resource exposes (default: 1), i.e. how
+# many pods can request affinity to that node concurrently.
+
+numaAffinity:
+  # Four allocatable slots pinned to NUMA node 0.
+  - name: node0
+    numaNode: 0
+    count: 4
+
+  # A single slot pinned to NUMA node 1.
+  - name: node1
+    numaNode: 1
+
+  # Slots pinned to NUMA node 0 on a separate resource domain.
+  - name: accel
+    numaNode: 0
+    count: 8
+    domain: accel.ydb.tech
