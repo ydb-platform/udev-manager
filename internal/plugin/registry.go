@@ -80,7 +80,32 @@ func (r *Registry) register(plugin *plugin) error {
 const (
 	registerBackoffInitial = 100 * time.Millisecond
 	registerBackoffMax     = 10 * time.Second
+
+	// reregisterDelay spaces out re-registration after a broken
+	// ListAndWatch stream, avoiding a tight register/drop loop against an
+	// unhealthy kubelet.
+	reregisterDelay = time.Second
 )
+
+// reregister re-registers plugin after the kubelet dropped its ListAndWatch
+// stream without restarting (no socket re-creation, so hup never fires). The
+// kubelet does not reconnect on its own; without a new registration the
+// resource stays invisible until the plugin pod is restarted.
+func (r *Registry) reregister(p *plugin) {
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		select {
+		case <-time.After(reregisterDelay):
+		case <-p.stopped:
+			return
+		case <-r.ctx.Done():
+			return
+		}
+		klog.Warningf("%s: ListAndWatch stream broken by kubelet; re-registering", p.resource.Name())
+		r.registerWithRetry(p)
+	}()
+}
 
 // registerWithRetry registers plugin with the kubelet, retrying with
 // exponential backoff until it succeeds, the plugin is stopped (e.g. replaced
@@ -129,7 +154,7 @@ func (r *Registry) hup() {
 	r.plugins.Range(func(key, p interface{}) bool {
 		old := p.(*plugin)
 		old.stop()
-		newP, err := newPlugin(old.resource, r.ctx, r.wg, r.pluginDir)
+		newP, err := newPlugin(old.resource, r.ctx, r.wg, r.pluginDir, r.reregister)
 		if err != nil {
 			klog.Errorf("failed to create plugin for %s: %v", old.resource.Name(), err)
 			return true
@@ -188,10 +213,23 @@ func NewRegistry(ctx context.Context, wg *sync.WaitGroup, opts ...RegistryOption
 
 		for {
 			select {
-			case event := <-r.watcher.Events:
+			case event, ok := <-r.watcher.Events:
+				if !ok {
+					return
+				}
 				if event.Op&fsnotify.Create != 0 && event.Name == r.kubeletSocket {
 					r.hup()
 				}
+			case err, ok := <-r.watcher.Errors:
+				if !ok {
+					return
+				}
+				// An error here (typically an inotify queue overflow)
+				// means events were lost — possibly the kubelet socket
+				// CREATE. Leaving this channel undrained would wedge the
+				// watcher entirely. Resync by re-registering everything.
+				klog.Errorf("kubelet socket watcher error, re-registering all plugins: %v", err)
+				r.hup()
 			case <-r.ctx.Done():
 				// Parent context is done, exit the goroutine.
 				return
@@ -236,7 +274,7 @@ func (r *Registry) Healthz(resp http.ResponseWriter, req *http.Request) {
 // backoff, so a kubelet that is briefly unavailable (e.g. restarting at the
 // same time as this plugin) does not cost the resource permanently.
 func (r *Registry) Add(resource Resource) error {
-	plugin, err := newPlugin(resource, r.ctx, r.wg, r.pluginDir)
+	plugin, err := newPlugin(resource, r.ctx, r.wg, r.pluginDir, r.reregister)
 	if err != nil {
 		klog.Errorf("failed to create plugin for resource %q Cause: %v", resource.Name(), err)
 		return err
