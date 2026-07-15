@@ -480,11 +480,16 @@ func (d *udevDiscovery) reconcile() {
 	}
 
 	d.mu.Lock()
+	before := len(d.state)
 	added, removed := applyEnumeration(d.state, found)
 	d.mu.Unlock()
 
 	if len(added) > 0 || len(removed) > 0 {
-		klog.Warningf("reconcile: repaired state drift: %d missed additions, %d missed removals", len(added), len(removed))
+		if before == 0 && len(removed) == 0 {
+			klog.V(4).Infof("reconcile: initial enumeration found %d devices", len(added))
+		} else {
+			klog.Warningf("reconcile: repaired state drift: %d missed additions, %d missed removals", len(added), len(removed))
+		}
 	}
 
 	for _, dev := range added {
