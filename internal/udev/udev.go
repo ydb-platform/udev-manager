@@ -414,7 +414,13 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 	// Step 3: process buffered and future events.
 	for {
 		select {
-		case dev := <-devChan:
+		case dev, ok := <-devChan:
+			if !ok {
+				// The monitor goroutine died and closed its channels;
+				// the errChan case performs the reconnect.
+				devChan = nil
+				continue
+			}
 			klog.V(5).Infof("Received device event (%s): %s", dev.Action(), dev.Syspath())
 			switch dev.Action() {
 			case ActionAdd, ActionOnline:
@@ -472,7 +478,10 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 				req.Reply(nil)
 				return
 			}
-		case err := <-errChan:
+		case err, ok := <-errChan:
+			if !ok {
+				err = fmt.Errorf("udev monitor channel closed")
+			}
 			klog.Errorf("Error from udev monitor, will try to retry connecting to udev: %v", err)
 		retry:
 			mon = d.udev.NewMonitorFromNetlink("udev")
