@@ -77,6 +77,51 @@ func (r *Registry) register(plugin *plugin) error {
 	return nil
 }
 
+const (
+	registerBackoffInitial = 100 * time.Millisecond
+	registerBackoffMax     = 10 * time.Second
+)
+
+// registerWithRetry registers plugin with the kubelet, retrying with
+// exponential backoff until it succeeds, the plugin is stopped (e.g. replaced
+// after a kubelet restart), or the registry shuts down.
+//
+// Registration must not fail permanently: a transient kubelet outage at
+// plugin startup would otherwise silently drop the resource until the next
+// process restart, advertising fewer devices than the host has.
+func (r *Registry) registerWithRetry(plugin *plugin) {
+	backoff := registerBackoffInitial
+	for attempt := 1; ; attempt++ {
+		err := r.register(plugin)
+		if err == nil {
+			return
+		}
+		klog.Errorf("failed to register %s with kubelet (attempt %d), retrying in %s: %v",
+			plugin.resource.Name(), attempt, backoff, err)
+		select {
+		case <-time.After(backoff):
+		case <-plugin.stopped:
+			return
+		case <-r.ctx.Done():
+			return
+		}
+		backoff *= 2
+		if backoff > registerBackoffMax {
+			backoff = registerBackoffMax
+		}
+	}
+}
+
+// registerAsync launches registerWithRetry on its own goroutine tracked by
+// the registry wait group.
+func (r *Registry) registerAsync(plugin *plugin) {
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		r.registerWithRetry(plugin)
+	}()
+}
+
 // hup registers all plugins with the freshly kubelet.
 // Newely started kubelet removes all socket files, so we need to re-register
 // all plugins. See https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#handling-kubelet-restarts
@@ -90,9 +135,7 @@ func (r *Registry) hup() {
 			return true
 		}
 		r.plugins.Store(key, newP)
-		if err := r.register(newP); err != nil {
-			klog.Errorf("failed to register %s: %v", newP.resource.Name(), err)
-		}
+		r.registerAsync(newP)
 		return true
 	})
 }
@@ -188,6 +231,10 @@ func (r *Registry) Healthz(resp http.ResponseWriter, req *http.Request) {
 // Add creates a new plugin for given Resource and registers it with the
 // kubelet. Attempts to register resource with the same name twice will result
 // in an error.
+//
+// Registration with the kubelet happens asynchronously and is retried with
+// backoff, so a kubelet that is briefly unavailable (e.g. restarting at the
+// same time as this plugin) does not cost the resource permanently.
 func (r *Registry) Add(resource Resource) error {
 	plugin, err := newPlugin(resource, r.ctx, r.wg, r.pluginDir)
 	if err != nil {
@@ -198,11 +245,9 @@ func (r *Registry) Add(resource Resource) error {
 	_, loaded := r.plugins.LoadOrStore(resource.Name(), plugin)
 	if loaded {
 		klog.Errorf("resource with name %q already exists", resource.Name())
+		plugin.stop()
 		return fmt.Errorf("resource with name %q already exists", resource.Name())
 	}
-	if err := r.register(plugin); err != nil {
-		klog.Errorf("failed to register resource %q Cause: %v", resource.Name(), err)
-		return err
-	}
+	r.registerAsync(plugin)
 	return nil
 }

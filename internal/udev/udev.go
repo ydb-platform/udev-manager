@@ -226,26 +226,56 @@ func (s *udevSlice) Subscribe(sink mux.Sink[[]Device]) mux.CancelFunc {
 }
 
 type udevDiscovery struct {
-	udev     libudev.Udev
-	mu       sync.RWMutex
-	state    map[Id]Device
-	requests chan mux.AwaitReply[monitorRequest, any]
-	mux      *mux.Mux[Event]
-	wg       *sync.WaitGroup
-	done     chan struct{} // closed when monitor exits
+	udev              libudev.Udev
+	mu                sync.RWMutex
+	state             map[Id]Device
+	requests          chan mux.AwaitReply[monitorRequest, any]
+	mux               *mux.Mux[Event]
+	wg                *sync.WaitGroup
+	done              chan struct{} // closed when monitor exits
+	reconcileInterval time.Duration
+}
+
+// DiscoveryOption configures a Discovery created by [NewDiscovery].
+type DiscoveryOption func(*udevDiscovery)
+
+// defaultReconcileInterval bounds how long a lost udev event can keep the
+// discovery state out of sync with sysfs.
+const defaultReconcileInterval = 60 * time.Second
+
+// monitorReceiveBufferSize is the kernel socket buffer requested for the udev
+// netlink monitor. The default (~208KB) overflows during boot-time coldplug
+// storms, and libudev reports overflow indistinguishably from "no more data",
+// silently dropping events.
+const monitorReceiveBufferSize = 32 * 1024 * 1024
+
+// WithReconcileInterval overrides how often the monitor re-enumerates devices
+// to repair state drift caused by lost udev events.
+func WithReconcileInterval(interval time.Duration) DiscoveryOption {
+	return func(d *udevDiscovery) { d.reconcileInterval = interval }
 }
 
 // NewDiscovery creates a real udev-backed Discovery. It starts a monitor
 // goroutine that opens the netlink socket, enumerates current devices, and
 // then processes events. The socket is opened before enumeration so the
 // kernel buffers events during the scan, eliminating the TOCTOU window.
-func NewDiscovery(wg *sync.WaitGroup) (Discovery, error) {
+//
+// Because netlink events can still be lost (kernel socket overflow, monitor
+// reconnects, slow consumers), the monitor additionally re-enumerates devices
+// every reconcile interval and emits synthetic Added/Removed events for any
+// drift it finds.
+func NewDiscovery(wg *sync.WaitGroup, opts ...DiscoveryOption) (Discovery, error) {
 	d := &udevDiscovery{
-		state:    make(map[Id]Device),
-		requests: make(chan mux.AwaitReply[monitorRequest, any]),
-		mux:      mux.Make[Event](),
-		wg:       wg,
-		done:     make(chan struct{}),
+		state:             make(map[Id]Device),
+		requests:          make(chan mux.AwaitReply[monitorRequest, any]),
+		mux:               mux.Make[Event](),
+		wg:                wg,
+		done:              make(chan struct{}),
+		reconcileInterval: defaultReconcileInterval,
+	}
+
+	for _, opt := range opts {
+		opt(d)
 	}
 
 	wg.Add(1)
@@ -377,39 +407,117 @@ func sliceSnapshot(state map[Id]Device) []Device {
 	return result
 }
 
+// newMonitor creates a udev netlink monitor, requests a large kernel receive
+// buffer, installs subsystem filters, and switches it to listening mode.
+//
+// The subsystem filters must cover every subsystem the plugin resource types
+// consume (partitions -> block, network bandwidth / RDMA -> net). Extend the
+// list when adding a resource type backed by another subsystem. Devices in
+// other subsystems still show up via enumeration (State / reconcile), but
+// their add/remove events are not delivered.
+func (d *udevDiscovery) newMonitor() (<-chan *libudev.Device, <-chan error, error) {
+	mon := d.udev.NewMonitorFromNetlink("udev")
+
+	// Best effort: needs CAP_NET_ADMIN; without it we run with the default
+	// buffer and rely on filters + reconciliation.
+	if err := mon.SetReceiveBufferSize(monitorReceiveBufferSize); err != nil {
+		klog.Warningf("Failed to set udev monitor receive buffer size: %v", err)
+	}
+
+	for _, subsystem := range []string{BlockSubsystem, NetSubsystem} {
+		if err := mon.FilterAddMatchSubsystem(subsystem); err != nil {
+			klog.Warningf("Failed to add udev monitor filter for subsystem %q: %v", subsystem, err)
+		}
+	}
+
+	return mon.DeviceChan(context.Background())
+}
+
+// applyEnumeration reconciles state with the set of devices found by an
+// enumeration pass. Devices missing from state are inserted, devices no
+// longer present are deleted. It returns the devices that were added and
+// removed. Callers must hold no lock; state is the caller-owned map guarded
+// by d.mu in the discovery case.
+func applyEnumeration(state map[Id]Device, found map[Id]Device) (added, removed []Device) {
+	for id, dev := range found {
+		if _, ok := state[id]; !ok {
+			state[id] = dev
+			added = append(added, dev)
+		}
+	}
+	for id, dev := range state {
+		if _, ok := found[id]; !ok {
+			delete(state, id)
+			removed = append(removed, dev)
+		}
+	}
+	return added, removed
+}
+
+// reconcile re-enumerates all devices and repairs any drift between sysfs and
+// the tracked state, emitting synthetic Added/Removed events for the
+// difference. This bounds the damage of lost udev events (kernel socket
+// overflow, monitor reconnects): without it, a single lost event would leave
+// the advertised resources wrong until the process restarts.
+func (d *udevDiscovery) reconcile() {
+	enum := d.udev.NewEnumerate()
+	devs, err := enum.Devices()
+	if err != nil {
+		klog.Errorf("reconcile: failed to enumerate devices: %v", err)
+		return
+	}
+
+	found := make(map[Id]Device, len(devs))
+	for _, dev := range devs {
+		if dev == nil {
+			klog.Error("reconcile: udev device is nil!")
+			continue
+		}
+		found[Id(dev.Syspath())] = &generic{
+			udev: d,
+			dev:  dev,
+		}
+	}
+
+	d.mu.Lock()
+	added, removed := applyEnumeration(d.state, found)
+	d.mu.Unlock()
+
+	if len(added) > 0 || len(removed) > 0 {
+		klog.Warningf("reconcile: repaired state drift: %d missed additions, %d missed removals", len(added), len(removed))
+	}
+
+	for _, dev := range added {
+		if err := d.mux.Submit(Added{dev}); err != nil {
+			klog.Errorf("reconcile: failed to submit Added event: %v", err)
+		}
+	}
+	for _, dev := range removed {
+		if err := d.mux.Submit(Removed{dev}); err != nil {
+			klog.Errorf("reconcile: failed to submit Removed event: %v", err)
+		}
+	}
+}
+
 func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer d.mux.Close()
 	defer close(d.done)
 
 	// Step 1: open the monitor socket so the kernel starts buffering events.
-	mon := d.udev.NewMonitorFromNetlink("udev")
-	devChan, errChan, err := mon.DeviceChan(context.Background())
+	devChan, errChan, err := d.newMonitor()
 	if err != nil {
 		klog.Errorf("Failed to create device channel: %v", err)
 		return
 	}
 
 	// Step 2: enumerate current devices while events buffer in devChan.
-	enum := d.udev.NewEnumerate()
-	devs, err := enum.Devices()
-	if err != nil {
-		klog.Errorf("Failed to enumerate devices: %v", err)
-		return
-	}
+	// There are no subscribers yet, so the synthetic events go nowhere; this
+	// pass only populates the initial state.
+	d.reconcile()
 
-	d.mu.Lock()
-	for _, dev := range devs {
-		if dev == nil {
-			klog.Error("udev device is nil!")
-			continue
-		}
-		d.state[Id(dev.Syspath())] = &generic{
-			udev: d,
-			dev:  dev,
-		}
-	}
-	d.mu.Unlock()
+	reconcileTicker := time.NewTicker(d.reconcileInterval)
+	defer reconcileTicker.Stop()
 
 	// Step 3: process buffered and future events.
 	for {
@@ -472,17 +580,20 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 				req.Reply(nil)
 				return
 			}
+		case <-reconcileTicker.C:
+			d.reconcile()
 		case err := <-errChan:
 			klog.Errorf("Error from udev monitor, will try to retry connecting to udev: %v", err)
 		retry:
-			mon = d.udev.NewMonitorFromNetlink("udev")
-			devChan, errChan, err = mon.DeviceChan(context.Background())
+			devChan, errChan, err = d.newMonitor()
 			if err != nil {
 				klog.Errorf("Failed to create device channel, retrying: %v", err)
 				time.Sleep(1 * time.Second)
 				goto retry
 			}
 			klog.Infof("Successfully reconnected to udev")
+			// Events emitted while the monitor was down are gone; resync.
+			d.reconcile()
 		}
 	}
 }
@@ -491,11 +602,26 @@ func (d *udevDiscovery) Subscribe(sink mux.Sink[Event]) mux.CancelFunc {
 	// here we're doing initialization in monitor goroutine
 	// to be able to pass consistent Init event to the sink
 	// before making fan out of udev events
-	await := mux.NewAwaitReply[monitorRequest, any](newSub{sink})
+	//
+	// The sink is wrapped in an elastic buffer so that a slow consumer (e.g.
+	// a scatter blocked on kubelet registration for seconds) cannot
+	// back-pressure the fan-out: without it, one stalled subscriber causes
+	// the monitor's mux.Submit to time out and drop the event for every
+	// subscriber, permanently desynchronizing advertised resources.
+	elastic := mux.ElasticSink(sink, klogLogger{})
+	await := mux.NewAwaitReply[monitorRequest, any](newSub{elastic})
 	select {
 	case d.requests <- await:
 		return await.Await().(mux.CancelFunc)
 	case <-d.done:
+		elastic.Close() // also closes the wrapped sink
 		return func() {}
 	}
+}
+
+// klogLogger adapts klog to the mux.Logger interface.
+type klogLogger struct{}
+
+func (klogLogger) Info(format string, args ...interface{}) {
+	klog.Infof(format, args...)
 }

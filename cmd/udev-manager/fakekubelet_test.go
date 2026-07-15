@@ -13,8 +13,10 @@ import (
 	. "github.com/onsi/gomega"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
@@ -26,6 +28,7 @@ type fakeKubelet struct {
 	pluginapi.UnimplementedRegistrationServer
 	mu            sync.Mutex
 	registrations []*pluginapi.RegisterRequest
+	failures      int
 	server        *grpc.Server
 	socketPath    string
 }
@@ -33,8 +36,19 @@ type fakeKubelet struct {
 func (fk *fakeKubelet) Register(_ context.Context, req *pluginapi.RegisterRequest) (*pluginapi.Empty, error) {
 	fk.mu.Lock()
 	defer fk.mu.Unlock()
+	if fk.failures > 0 {
+		fk.failures--
+		return nil, status.Error(codes.Unavailable, "fake kubelet: not ready")
+	}
 	fk.registrations = append(fk.registrations, req)
 	return &pluginapi.Empty{}, nil
+}
+
+// FailRegistrations makes the next n Register calls fail with Unavailable.
+func (fk *fakeKubelet) FailRegistrations(n int) {
+	fk.mu.Lock()
+	defer fk.mu.Unlock()
+	fk.failures = n
 }
 
 // Registrations returns a snapshot of all received registration requests.
