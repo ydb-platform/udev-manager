@@ -3,6 +3,7 @@ package udev
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -249,6 +250,12 @@ const defaultReconcileInterval = 60 * time.Second
 // silently dropping events.
 const monitorReceiveBufferSize = 32 * 1024 * 1024
 
+// burstSettleDelay is how long the event stream must stay quiet after a
+// burst before an extra reconciliation runs. Buffer overruns happen exactly
+// during bursts and cannot be observed, so resyncing right after one settles
+// repairs any loss without waiting out the periodic reconcile interval.
+const burstSettleDelay = 2 * time.Second
+
 // WithReconcileInterval overrides how often the monitor re-enumerates devices
 // to repair state drift caused by lost udev events.
 func WithReconcileInterval(interval time.Duration) DiscoveryOption {
@@ -418,11 +425,14 @@ func sliceSnapshot(state map[Id]Device) []Device {
 func (d *udevDiscovery) newMonitor() (<-chan *libudev.Device, <-chan error, error) {
 	mon := d.udev.NewMonitorFromNetlink("udev")
 
-	// Best effort: needs CAP_NET_ADMIN; without it we run with the default
-	// buffer and rely on filters + reconciliation.
+	// Best effort: needs CAP_NET_ADMIN. Without it libudev falls back to
+	// SO_RCVBUF, which the kernel clamps to net.core.rmem_max WITHOUT
+	// returning an error — so this call succeeding proves nothing. The
+	// clamp is detected separately below.
 	if err := mon.SetReceiveBufferSize(monitorReceiveBufferSize); err != nil {
 		klog.Warningf("Failed to set udev monitor receive buffer size: %v", err)
 	}
+	warnIfReceiveBufferClamped()
 
 	for _, subsystem := range []string{BlockSubsystem, NetSubsystem} {
 		if err := mon.FilterAddMatchSubsystem(subsystem); err != nil {
@@ -431,6 +441,61 @@ func (d *udevDiscovery) newMonitor() (<-chan *libudev.Device, <-chan error, erro
 	}
 
 	return mon.DeviceChan(context.Background())
+}
+
+// warnIfReceiveBufferClamped detects the silent failure mode of
+// SetReceiveBufferSize. Without CAP_NET_ADMIN the kernel clamps SO_RCVBUF to
+// net.core.rmem_max without an error, and go-udev cannot distinguish the
+// resulting ENOBUFS overruns from "no more data" (udev_monitor_receive_device
+// returns NULL for both), so overflowed events vanish without a trace. The
+// overrun itself is undetectable at runtime; predict and warn up front.
+func warnIfReceiveBufferClamped() {
+	if hasCapNetAdmin() {
+		return
+	}
+	rmemMax, err := readIntFile("/proc/sys/net/core/rmem_max")
+	if err != nil {
+		klog.Warningf("Cannot determine net.core.rmem_max: %v", err)
+		return
+	}
+	if rmemMax < monitorReceiveBufferSize {
+		klog.Infof(
+			"Running without CAP_NET_ADMIN: udev netlink receive buffer clamped to "+
+				"net.core.rmem_max=%d (requested %d). Overruns during udev event storms drop "+
+				"events silently; they are repaired by reconciliation (periodic and post-burst). "+
+				"Raising net.core.rmem_max on the host avoids the loss entirely.",
+			rmemMax, monitorReceiveBufferSize)
+	}
+}
+
+// hasCapNetAdmin reports whether CAP_NET_ADMIN is in the process's effective
+// capability set, per /proc/self/status.
+func hasCapNetAdmin() bool {
+	const capNetAdmin = 12
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		hexMask, ok := strings.CutPrefix(line, "CapEff:")
+		if !ok {
+			continue
+		}
+		mask, err := strconv.ParseUint(strings.TrimSpace(hexMask), 16, 64)
+		if err != nil {
+			return false
+		}
+		return mask&(1<<capNetAdmin) != 0
+	}
+	return false
+}
+
+func readIntFile(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(data)))
 }
 
 // applyEnumeration reconciles state with the set of devices found by an
@@ -519,10 +584,25 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 	reconcileTicker := time.NewTicker(d.reconcileInterval)
 	defer reconcileTicker.Stop()
 
+	// Netlink overruns happen during event storms and are invisible to us
+	// (see warnIfReceiveBufferClamped), so reconcile shortly after each
+	// burst settles instead of waiting out the full ticker interval. The
+	// timer also fires once shortly after startup, covering the boot-time
+	// coldplug storm.
+	burstSettle := time.NewTimer(burstSettleDelay)
+	defer burstSettle.Stop()
+
 	// Step 3: process buffered and future events.
 	for {
 		select {
-		case dev := <-devChan:
+		case dev, ok := <-devChan:
+			if !ok {
+				// The monitor goroutine died and closed its channels;
+				// the errChan case performs the reconnect.
+				devChan = nil
+				continue
+			}
+			burstSettle.Reset(burstSettleDelay)
 			klog.V(5).Infof("Received device event (%s): %s", dev.Action(), dev.Syspath())
 			switch dev.Action() {
 			case ActionAdd, ActionOnline:
@@ -582,7 +662,12 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 			}
 		case <-reconcileTicker.C:
 			d.reconcile()
-		case err := <-errChan:
+		case <-burstSettle.C:
+			d.reconcile()
+		case err, ok := <-errChan:
+			if !ok {
+				err = fmt.Errorf("udev monitor channel closed")
+			}
 			klog.Errorf("Error from udev monitor, will try to retry connecting to udev: %v", err)
 		retry:
 			devChan, errChan, err = d.newMonitor()
