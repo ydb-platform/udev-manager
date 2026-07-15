@@ -377,6 +377,76 @@ func sliceSnapshot(state map[Id]Device) []Device {
 	return result
 }
 
+// reconcileInterval is how often the monitor re-enumerates the full device set
+// from sysfs and reconciles it against its in-memory state. Events normally
+// arrive over the netlink socket and keep state current; reconciliation is the
+// backstop for events dropped before they reach us (a socket buffer overrun
+// during a boot-time udev storm) and for the gap after a monitor reconnect.
+const reconcileInterval = time.Minute
+
+// diffDevices compares the current in-memory device set against a freshly
+// enumerated one. It returns the devices to add (present in enumerated but not
+// current) and to remove (present in current but not enumerated). Neither map
+// is mutated.
+func diffDevices(current, enumerated map[Id]Device) (added, removed []Device) {
+	for id, dev := range enumerated {
+		if _, ok := current[id]; !ok {
+			added = append(added, dev)
+		}
+	}
+	for id, dev := range current {
+		if _, ok := enumerated[id]; !ok {
+			removed = append(removed, dev)
+		}
+	}
+	return added, removed
+}
+
+// reconcile re-enumerates the current device set and brings d.state into
+// agreement with it, emitting Added for devices that appeared and Removed for
+// devices that vanished while events may have been missed. It must be called
+// from the monitor goroutine, the sole writer of d.state.
+func (d *udevDiscovery) reconcile() {
+	enum := d.udev.NewEnumerate()
+	devs, err := enum.Devices()
+	if err != nil {
+		klog.Errorf("reconcile: failed to enumerate devices: %v", err)
+		return
+	}
+
+	enumerated := make(map[Id]Device, len(devs))
+	for _, dev := range devs {
+		if dev == nil {
+			continue
+		}
+		id := Id(dev.Syspath())
+		enumerated[id] = &generic{udev: d, dev: dev}
+	}
+
+	d.mu.Lock()
+	added, removed := diffDevices(d.state, enumerated)
+	for _, dev := range added {
+		d.state[dev.Id()] = dev
+	}
+	for _, dev := range removed {
+		delete(d.state, dev.Id())
+	}
+	d.mu.Unlock()
+
+	for _, dev := range added {
+		klog.Infof("reconcile: device appeared while unwatched: %s", dev.Id())
+		if err := d.mux.Submit(Added{dev}); err != nil {
+			klog.Errorf("reconcile: failed to submit Added event: %v", err)
+		}
+	}
+	for _, dev := range removed {
+		klog.Infof("reconcile: device vanished while unwatched: %s", dev.Id())
+		if err := d.mux.Submit(Removed{dev}); err != nil {
+			klog.Errorf("reconcile: failed to submit Removed event: %v", err)
+		}
+	}
+}
+
 func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer d.mux.Close()
@@ -411,9 +481,16 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 	}
 	d.mu.Unlock()
 
-	// Step 3: process buffered and future events.
+	// Step 3: process buffered and future events, periodically reconciling
+	// against a fresh enumeration to recover any events dropped between the
+	// netlink socket and this handler (e.g. an ENOBUFS overrun).
+	ticker := time.NewTicker(reconcileInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
+		case <-ticker.C:
+			d.reconcile()
 		case dev := <-devChan:
 			klog.V(5).Infof("Received device event (%s): %s", dev.Action(), dev.Syspath())
 			switch dev.Action() {
@@ -483,6 +560,10 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 				goto retry
 			}
 			klog.Infof("Successfully reconnected to udev")
+			// Events emitted during the disconnect window were lost; the new
+			// socket only carries events from now on. Reconcile against a
+			// fresh enumeration to catch up.
+			d.reconcile()
 		}
 	}
 }
