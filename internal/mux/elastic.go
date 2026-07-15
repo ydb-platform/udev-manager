@@ -58,6 +58,8 @@ func (e *elasticSink[T]) run() {
 			continue
 		}
 		v := e.queue[0]
+		var zero T
+		e.queue[0] = zero
 		e.queue = e.queue[1:]
 		if len(e.queue) == 0 {
 			e.queue = nil // let the backing array be collected

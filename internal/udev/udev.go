@@ -587,7 +587,11 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 			}
 		case <-reconcileTicker.C:
 			d.reconcile()
-		case err := <-errChan:
+		case err, ok := <-errChan:
+			if !ok {
+				klog.Errorf("udev: monitor error channel closed")
+				return
+			}
 			klog.Errorf("Error from udev monitor, will try to retry connecting to udev: %v", err)
 		retry:
 			devChan, errChan, err = d.newMonitor()
