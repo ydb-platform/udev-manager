@@ -6,11 +6,9 @@ import (
 	"net"
 	"os"
 	"sync"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	"github.com/kennygrant/sanitize"
@@ -96,7 +94,9 @@ func (p *plugin) PreStartContainer(context.Context, *pluginapi.PreStartContainer
 }
 
 func (p *plugin) ListAndWatch(empty *pluginapi.Empty, stream pluginapi.DevicePlugin_ListAndWatchServer) (err error) {
-	defer klog.Infof("%q: closing ListAndWatch connection, err = %v", p.resource.Name(), err)
+	defer func() {
+		klog.Infof("%q: closing ListAndWatch connection, err = %v", p.resource.Name(), err)
+	}()
 
 	ctx := stream.Context()
 	instanceCh := p.resource.ListAndWatch(ctx)
@@ -184,35 +184,4 @@ func (p *plugin) Allocate(ctx context.Context, request *pluginapi.AllocateReques
 
 func (p *plugin) socketPath() string {
 	return sanitize.BaseName(p.resource.Name()) + ".sock"
-}
-
-func (p *plugin) probe(ctx context.Context) error {
-	timeoutCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel()
-
-	pluginAddr := "unix://" + p.pluginDir + p.socketPath()
-
-	conn, err := grpc.NewClient(
-		pluginAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		klog.Errorf("%q: failed to dial %q: %v", p.resource.Name(), pluginAddr, err)
-		return fmt.Errorf("failed to dial %q: %w", pluginAddr, err)
-	}
-	defer func() {
-		if err := conn.Close(); err != nil {
-			klog.Errorf("%q: failed to close connection: %v", p.resource.Name(), err)
-		}
-	}()
-
-	client := pluginapi.NewDevicePluginClient(conn)
-	_, err = client.GetDevicePluginOptions(timeoutCtx, &pluginapi.Empty{})
-
-	if err != nil {
-		klog.Errorf("%q: failed to get device plugin options: %v", p.resource.Name(), err)
-		return fmt.Errorf("plugin[%q]: failed to get device plugin options: %w", p.resource.Name(), err)
-	}
-
-	return nil
 }

@@ -16,6 +16,7 @@ type mockDevice struct {
 	sysattrs   map[string]string
 	numaNode   int
 	parent     udev.Device
+	debugFn    func() string
 }
 
 func (m *mockDevice) Id() udev.Id         { return m.id }
@@ -77,7 +78,12 @@ func (m *mockDevice) SystemAttributeLookup(k string) string {
 
 func (m *mockDevice) Tags() []string { return nil }
 func (m *mockDevice) NumaNode() int  { return m.numaNode }
-func (m *mockDevice) Debug() string  { return fmt.Sprintf("mockDevice{id:%s}", m.id) }
+func (m *mockDevice) Debug() string {
+	if m.debugFn != nil {
+		return m.debugFn()
+	}
+	return fmt.Sprintf("mockDevice{id:%s}", m.id)
+}
 
 // partitionDevice constructs a mock block partition device with the given syspath id and partition label.
 func partitionDevice(id, label string) *mockDevice {

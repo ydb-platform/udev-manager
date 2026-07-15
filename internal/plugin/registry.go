@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"path"
 	"sync"
 	"time"
@@ -26,6 +27,11 @@ type Registry struct {
 	watcher       *fsnotify.Watcher
 	pluginDir     string
 	kubeletSocket string
+	kubeletInfo   os.FileInfo
+	initOnce      sync.Once
+	initMu        sync.RWMutex
+	initialized   bool
+	initErr       error
 }
 
 // RegistryOption configures a [Registry] created by [NewRegistry].
@@ -133,6 +139,10 @@ func NewRegistry(ctx context.Context, wg *sync.WaitGroup, opts ...RegistryOption
 		}
 		return nil, fmt.Errorf("failed to watch kubelet socket dir %q: %w", kubeletSocketDir, err)
 	}
+	// Remember the socket that was present when the watcher started. Some
+	// fsnotify backends can emit duplicate Create events for an existing Unix
+	// socket; file identity lets us distinguish those from a kubelet restart.
+	registry.kubeletInfo, _ = os.Stat(registry.kubeletSocket)
 
 	registry.wg.Add(1)
 	go func(r *Registry) {
@@ -145,9 +155,21 @@ func NewRegistry(ctx context.Context, wg *sync.WaitGroup, opts ...RegistryOption
 
 		for {
 			select {
-			case event := <-r.watcher.Events:
-				if event.Op&fsnotify.Create != 0 && event.Name == r.kubeletSocket {
-					r.hup()
+			case event, ok := <-r.watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Name == r.kubeletSocket {
+					if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+						r.kubeletInfo = nil
+					}
+					if event.Op&fsnotify.Create != 0 && r.kubeletSocketChanged() {
+						r.hup()
+					}
+				}
+			case err, ok := <-r.watcher.Errors:
+				if ok {
+					klog.Errorf("kubelet socket watcher error: %v", err)
 				}
 			case <-r.ctx.Done():
 				// Parent context is done, exit the goroutine.
@@ -159,30 +181,74 @@ func NewRegistry(ctx context.Context, wg *sync.WaitGroup, opts ...RegistryOption
 	return registry, nil
 }
 
-// Healthz is an HTTP handler that reports the health of all registered device
-// plugins. It returns 200 OK if all plugins pass their probe, or 500 Internal
-// Server Error listing the failing plugins.
-func (r *Registry) Healthz(resp http.ResponseWriter, req *http.Request) {
-	unhealthy := make([]string, 0)
-	r.plugins.Range(func(_, p interface{}) bool {
-		plugin := p.(*plugin)
-		if err := plugin.probe(req.Context()); err != nil {
-			klog.Errorf("probe failed for %s: %v", plugin.resource.Name(), err)
-			unhealthy = append(unhealthy, plugin.resource.Name())
-		} else {
-			klog.V(2).Infof("probe succeeded for %s", plugin.resource.Name())
-		}
-		return true
-	})
-
-	if len(unhealthy) == 0 {
-		resp.WriteHeader(http.StatusOK)
-	} else {
-		resp.WriteHeader(http.StatusInternalServerError)
-		for _, name := range unhealthy {
-			_, _ = fmt.Fprintf(resp, "probe failed for device plugin %q\n", name)
-		}
+func (r *Registry) kubeletSocketChanged() bool {
+	info, err := os.Stat(r.kubeletSocket)
+	if err != nil {
+		klog.Errorf("failed to stat kubelet socket %q after create event: %v", r.kubeletSocket, err)
+		return false
 	}
+	if r.kubeletInfo != nil && os.SameFile(r.kubeletInfo, info) {
+		return false
+	}
+	r.kubeletInfo = info
+	return true
+}
+
+// SetInitialized records the result of initial udev discovery and resource
+// registration. The first result wins because discovery has exactly one Init
+// event. Readyz remains false when initialization reports any error.
+func (r *Registry) SetInitialized(err error) {
+	r.initOnce.Do(func() {
+		r.initMu.Lock()
+		r.initialized = true
+		r.initErr = err
+		r.initMu.Unlock()
+
+		if err != nil {
+			klog.Errorf("initial device discovery or registration failed: %v", err)
+		} else {
+			klog.Info("initial device discovery and registration completed")
+		}
+	})
+}
+
+// Healthz is a constant-time liveness handler. It deliberately does not dial
+// every plugin socket: liveness must remain responsive while initial discovery
+// is CPU-intensive and as the number of device resources grows.
+func (r *Registry) Healthz(resp http.ResponseWriter, _ *http.Request) {
+	select {
+	case <-r.ctx.Done():
+		http.Error(resp, "shutting down", http.StatusServiceUnavailable)
+	default:
+		resp.WriteHeader(http.StatusOK)
+	}
+}
+
+// Readyz reports whether the complete initial udev snapshot was processed and
+// every staged resource registration succeeded. It is also suitable for a
+// Kubernetes startup probe.
+func (r *Registry) Readyz(resp http.ResponseWriter, _ *http.Request) {
+	select {
+	case <-r.ctx.Done():
+		http.Error(resp, "shutting down", http.StatusServiceUnavailable)
+		return
+	default:
+	}
+
+	r.initMu.RLock()
+	initialized := r.initialized
+	initErr := r.initErr
+	r.initMu.RUnlock()
+
+	if !initialized {
+		http.Error(resp, "initial device discovery is still in progress", http.StatusServiceUnavailable)
+		return
+	}
+	if initErr != nil {
+		http.Error(resp, fmt.Sprintf("initial device discovery failed: %v", initErr), http.StatusServiceUnavailable)
+		return
+	}
+	resp.WriteHeader(http.StatusOK)
 }
 
 // Add creates a new plugin for given Resource and registers it with the

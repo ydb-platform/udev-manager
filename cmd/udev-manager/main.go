@@ -52,6 +52,8 @@ func main() {
 	klog.Infof("Starting /healthz server on port %s", healthCheckAddr)
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/healthz", registry.Healthz)
+	healthMux.HandleFunc("/readyz", registry.Readyz)
+	healthMux.HandleFunc("/startupz", registry.Readyz)
 	healthSrv := &http.Server{Addr: healthCheckAddr, Handler: healthMux}
 	go func() {
 		if err := healthSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -92,21 +94,19 @@ func startApp(
 
 	domain := config.DeviceDomain
 
-	cancel := mux.CancelFunc(func() {})
+	handlers := make([]plugin.DeviceHandler, 0,
+		len(config.Partitions)+len(config.BatchPartitions)+
+			len(config.NetworkBandwidth)+len(config.NetworkRdma))
 	for _, partConfig := range config.Partitions {
 		partDomain := partConfig.DomainOverride
 		if partDomain == "" {
 			partDomain = domain
 		}
-		cancel = mux.ChainCancelFunc(
-			plugin.NewScatter(
-				discovery,
-				registry,
-				plugin.PartitionLabelMatcherTemplater(partDomain, partConfig.matcher),
-				plugin.PartitionLabelMatcherInstances(partDomain, partConfig.matcher, config.DisableTopologyHints),
-			),
-			cancel,
-		)
+		handlers = append(handlers, plugin.NewScatterHandler(
+			registry,
+			plugin.PartitionLabelMatcherTemplater(partDomain, partConfig.matcher),
+			plugin.PartitionLabelMatcherInstances(partDomain, partConfig.matcher, config.DisableTopologyHints),
+		))
 	}
 
 	for _, batchConfig := range config.BatchPartitions {
@@ -114,45 +114,34 @@ func startApp(
 		if batchDomain == "" {
 			batchDomain = domain
 		}
-		cancel = mux.ChainCancelFunc(
-			plugin.NewBatchPartitionScatter(
-				discovery,
-				registry,
-				batchDomain,
-				batchConfig.Name,
-				batchConfig.matcher,
-				batchConfig.Count,
-			),
-			cancel,
-		)
+		handlers = append(handlers, plugin.NewBatchPartitionHandler(
+			registry,
+			batchDomain,
+			batchConfig.Name,
+			batchConfig.matcher,
+			batchConfig.Count,
+		))
 	}
 
 	for _, netBWConfig := range config.NetworkBandwidth {
-		cancel = mux.ChainCancelFunc(
-			plugin.NewScatter(
-				discovery,
-				registry,
-				plugin.NetBWMatcherTemplater(domain, netBWConfig.matcher),
-				plugin.NetBWMatcherInstances(domain, netBWConfig.matcher, netBWConfig.MbpsPerShare),
-			),
-			cancel,
-		)
+		handlers = append(handlers, plugin.NewScatterHandler(
+			registry,
+			plugin.NetBWMatcherTemplater(domain, netBWConfig.matcher),
+			plugin.NetBWMatcherInstances(domain, netBWConfig.matcher, netBWConfig.MbpsPerShare),
+		))
 	}
 
 	for _, netRdmaConfig := range config.NetworkRdma {
-		cancel = mux.ChainCancelFunc(
-			plugin.NewScatter(
-				discovery,
-				registry,
-				plugin.NetRdmaMatcherTemplater(domain, netRdmaConfig.matcher),
-				plugin.NetRdmaMatcherInstances(domain, netRdmaConfig.matcher, int(netRdmaConfig.ResourceCount)),
-			),
-			cancel,
-		)
+		handlers = append(handlers, plugin.NewScatterHandler(
+			registry,
+			plugin.NetRdmaMatcherTemplater(domain, netRdmaConfig.matcher),
+			plugin.NetRdmaMatcherInstances(domain, netRdmaConfig.matcher, int(netRdmaConfig.ResourceCount)),
+		))
 	}
 
 	// numaAffinity resources are static and udev-independent: register them
 	// directly with the registry rather than wiring a discovery scatter.
+	var setupErrors []error
 	for _, numaConfig := range config.NumaAffinity {
 		numaDomain := numaConfig.DomainOverride
 		if numaDomain == "" {
@@ -166,8 +155,21 @@ func startApp(
 			numaConfig.Count,
 		); err != nil {
 			klog.Errorf("failed to create numa affinity resource %q: %v", numaConfig.Name, err)
+			setupErrors = append(setupErrors, fmt.Errorf(
+				"failed to create numa affinity resource %q: %w", numaConfig.Name, err,
+			))
 		}
 	}
+
+	setupErr := errors.Join(setupErrors...)
+	if len(handlers) == 0 {
+		registry.SetInitialized(setupErr)
+		return registry, mux.CancelFunc(func() {}), nil
+	}
+
+	cancel := plugin.RunDeviceHandlers(discovery, func(initErr error) {
+		registry.SetInitialized(errors.Join(setupErr, initErr))
+	}, handlers...)
 
 	return registry, cancel, nil
 }

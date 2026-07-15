@@ -645,8 +645,8 @@ partitions:
 		})
 	})
 
-	Describe("Healthz endpoint", func() {
-		It("returns 200 when all plugins are healthy", func() {
+	Describe("probe endpoints", func() {
+		It("returns ready only after initial registration completes", func() {
 			dev := makePartitionDevice("/sys/block/nvme0n1/nvme0n1p1", "/dev/nvme0n1p1", "nvme_disk01")
 			discovery.AddDevice(dev)
 
@@ -659,13 +659,15 @@ partitions:
 			registry := startTestApp(ctx, wg, discovery, config, tmpDir, kubeSock)
 			waitForRegistrations(kubelet, 1)
 
-			rec := httptest.NewRecorder()
-			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/healthz", nil)
-			registry.Healthz(rec, req)
-			Expect(rec.Code).To(Equal(http.StatusOK))
+			Eventually(func() int {
+				rec := httptest.NewRecorder()
+				req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/readyz", nil)
+				registry.Readyz(rec, req)
+				return rec.Code
+			}).Should(Equal(http.StatusOK))
 		})
 
-		It("returns 500 when a plugin socket is gone", func() {
+		It("keeps constant-time liveness independent of plugin socket count", func() {
 			dev := makePartitionDevice("/sys/block/nvme0n1/nvme0n1p1", "/dev/nvme0n1p1", "nvme_disk01")
 			discovery.AddDevice(dev)
 
@@ -686,8 +688,7 @@ partitions:
 			rec := httptest.NewRecorder()
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/healthz", nil)
 			registry.Healthz(rec, req)
-			Expect(rec.Code).To(Equal(http.StatusInternalServerError))
-			Expect(rec.Body.String()).To(ContainSubstring("ydb.tech/part-disk01"))
+			Expect(rec.Code).To(Equal(http.StatusOK))
 		})
 	})
 

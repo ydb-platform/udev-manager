@@ -77,6 +77,14 @@ type batchPartitionSeat struct {
 	pool *batchPartitionPool
 }
 
+type batchPartitionHandler struct {
+	registry *Registry
+	pool     *batchPartitionPool
+	matcher  *regexp.Regexp
+	res      *resource
+	seats    []Instance
+}
+
 func (s *batchPartitionSeat) Id() Id { return s.id }
 
 func (s *batchPartitionSeat) Health() Health { return s.pool.health() }
@@ -115,17 +123,16 @@ func matchBatchPartitionDevice(dev udev.Device, matcher *regexp.Regexp) (udev.Id
 	return dev.Id(), label, true
 }
 
-// NewBatchPartitionScatter creates a batch partition resource that aggregates all partitions
-// matching the given regexp into a single allocatable Kubernetes resource.
-// count controls how many pods can simultaneously hold the resource (each gets all partitions).
-func NewBatchPartitionScatter(
-	d udev.Discovery,
+// NewBatchPartitionHandler creates a staged batch resource handler. The
+// resource is not registered until InitComplete, after the complete initial
+// udev snapshot has populated the pool.
+func NewBatchPartitionHandler(
 	registry *Registry,
 	domain string,
 	name string,
 	matcher *regexp.Regexp,
 	count int,
-) mux.CancelFunc {
+) DeviceHandler {
 	pool := &batchPartitionPool{
 		parts:  make(map[udev.Id]udev.Device),
 		labels: make(map[udev.Id]string),
@@ -148,16 +155,80 @@ func NewBatchPartitionScatter(
 		Prefix: "batch-" + name,
 	}, instanceMap)
 
-	if err := registry.Add(res); err != nil {
-		klog.Errorf("failed to add batch partition resource %s: %v", res.Name(), err)
-		res.Close()
-		return func() {}
+	return &batchPartitionHandler{
+		registry: registry,
+		pool:     pool,
+		matcher:  matcher,
+		res:      res,
+		seats:    seats,
 	}
+}
 
-	ch := make(chan udev.Event, 1)
-	go runBatchPartitionScatter(ch, pool, matcher, res, seats)
+// NewBatchPartitionScatter is retained for standalone callers. startApp uses
+// RunDeviceHandlers to share one discovery subscription across all handlers.
+func NewBatchPartitionScatter(
+	d udev.Discovery,
+	registry *Registry,
+	domain string,
+	name string,
+	matcher *regexp.Regexp,
+	count int,
+) mux.CancelFunc {
+	handler := NewBatchPartitionHandler(registry, domain, name, matcher, count)
+	return RunDeviceHandlers(d, nil, handler)
+}
 
-	return d.Subscribe(mux.SinkFromChan(ch))
+func (h *batchPartitionHandler) InitDevice(dev udev.Device) error {
+	if id, label, ok := matchBatchPartitionDevice(dev, h.matcher); ok {
+		h.pool.add(dev, label)
+		klog.V(5).Infof("batch %s: init matched partition %s", h.res.Name(), id)
+	}
+	return nil
+}
+
+func (h *batchPartitionHandler) InitComplete() error {
+	if !h.pool.empty() {
+		if err := h.res.Submit(HealthEvent{Instances: h.seats, Health: Healthy{}}); err != nil {
+			return fmt.Errorf("batch %s: failed to submit initial health: %w", h.res.Name(), err)
+		}
+	}
+	if h.registry != nil {
+		if err := h.registry.Add(h.res); err != nil {
+			return fmt.Errorf("failed to add batch partition resource %s: %w", h.res.Name(), err)
+		}
+	}
+	return nil
+}
+
+func (h *batchPartitionHandler) Added(dev udev.Device) error {
+	id, label, ok := matchBatchPartitionDevice(dev, h.matcher)
+	if !ok {
+		return nil
+	}
+	wasEmpty := h.pool.empty()
+	h.pool.add(dev, label)
+	klog.V(5).Infof("batch %s: added partition %s", h.res.Name(), id)
+	if wasEmpty {
+		if err := h.res.Submit(HealthEvent{Instances: h.seats, Health: Healthy{}}); err != nil {
+			return fmt.Errorf("batch %s: failed to submit healthy event: %w", h.res.Name(), err)
+		}
+	}
+	return nil
+}
+
+func (h *batchPartitionHandler) Removed(dev udev.Device) error {
+	id, _, ok := matchBatchPartitionDevice(dev, h.matcher)
+	if !ok {
+		return nil
+	}
+	h.pool.remove(id)
+	klog.V(5).Infof("batch %s: removed partition %s", h.res.Name(), id)
+	if h.pool.empty() {
+		if err := h.res.Submit(HealthEvent{Instances: h.seats, Health: Unhealthy{}}); err != nil {
+			return fmt.Errorf("batch %s: failed to submit unhealthy event: %w", h.res.Name(), err)
+		}
+	}
+	return nil
 }
 
 func runBatchPartitionScatter(
@@ -167,46 +238,30 @@ func runBatchPartitionScatter(
 	res *resource,
 	seats []Instance,
 ) {
+	handler := &batchPartitionHandler{
+		pool:    pool,
+		matcher: matcher,
+		res:     res,
+		seats:   seats,
+	}
 	for ev := range evCh {
 		switch ev := ev.(type) {
 		case udev.Init:
 			for _, dev := range ev.Devices {
-				if id, label, ok := matchBatchPartitionDevice(dev, matcher); ok {
-					pool.add(dev, label)
-					klog.V(5).Infof("batch %s: init matched partition %s", res.Name(), id)
-				}
+				_ = handler.InitDevice(dev)
 			}
-			if !pool.empty() {
-				if err := res.Submit(HealthEvent{Instances: seats, Health: Healthy{}}); err != nil {
-					klog.Errorf("batch %s: failed to submit health event: %v", res.Name(), err)
-				}
+			if err := handler.InitComplete(); err != nil {
+				klog.Errorf("batch %s: failed to finish initialization: %v", res.Name(), err)
 			}
 
 		case udev.Added:
-			id, label, ok := matchBatchPartitionDevice(ev.Device, matcher)
-			if !ok {
-				continue
-			}
-			wasEmpty := pool.empty()
-			pool.add(ev.Device, label)
-			klog.V(5).Infof("batch %s: added partition %s", res.Name(), id)
-			if wasEmpty {
-				if err := res.Submit(HealthEvent{Instances: seats, Health: Healthy{}}); err != nil {
-					klog.Errorf("batch %s: failed to submit health event: %v", res.Name(), err)
-				}
+			if err := handler.Added(ev.Device); err != nil {
+				klog.Errorf("batch %s: failed to add device: %v", res.Name(), err)
 			}
 
 		case udev.Removed:
-			id, _, ok := matchBatchPartitionDevice(ev.Device, matcher)
-			if !ok {
-				continue
-			}
-			pool.remove(id)
-			klog.V(5).Infof("batch %s: removed partition %s", res.Name(), id)
-			if pool.empty() {
-				if err := res.Submit(HealthEvent{Instances: seats, Health: Unhealthy{}}); err != nil {
-					klog.Errorf("batch %s: failed to submit health event: %v", res.Name(), err)
-				}
+			if err := handler.Removed(ev.Device); err != nil {
+				klog.Errorf("batch %s: failed to remove device: %v", res.Name(), err)
 			}
 		}
 	}

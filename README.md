@@ -40,7 +40,7 @@ The binary accepts a `--config` flag with one of:
 |---|---|---|
 | `domain` | string | **Required.** Resource domain (e.g. `ydb.tech`). |
 | `disable_topology_hints` | bool | Disable NUMA topology hints for partition devices. |
-| `health_check_port` | uint16 | Port for `/healthz` endpoint (default: `8080`). |
+| `health_check_port` | uint16 | Port for `/healthz`, `/readyz`, and `/startupz` endpoints (default: `8080`). |
 | `partitions` | list | Expose each matching partition as its own resource. |
 | `batchPartitions` | list | Group matching partitions into a single resource. |
 | `networkBandwidth` | list | Expose network bandwidth shares as resources. |
@@ -103,6 +103,41 @@ numaAffinity:
   - name: node1
     numaNode: 1              # count defaults to 1
     domain: accel.example.com  # optional domain override
+```
+
+## Kubernetes probes
+
+The probe endpoints have deliberately separate responsibilities:
+
+| Endpoint | Purpose |
+|---|---|
+| `/healthz` | Constant-time liveness. It does not synchronously probe every device socket. |
+| `/readyz` | Ready only after the complete initial udev snapshot is processed and all staged resources are registered. |
+| `/startupz` | Alias of `/readyz`, intended for a startup probe. |
+
+Use a startup budget long enough for the largest expected host inventory:
+
+```yaml
+startupProbe:
+  httpGet:
+    path: /startupz
+    port: 8580
+  timeoutSeconds: 3
+  periodSeconds: 5
+  failureThreshold: 24
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8580
+  timeoutSeconds: 3
+  periodSeconds: 5
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8580
+  timeoutSeconds: 3
+  periodSeconds: 10
+  failureThreshold: 3
 ```
 
 ## Development

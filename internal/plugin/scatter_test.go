@@ -55,6 +55,39 @@ var _ = Describe("Scatter", func() {
 			scatter.added(dev)
 			Consistently(watchCh, 50*time.Millisecond).ShouldNot(Receive())
 		})
+
+		It("does not build expensive device debug output when verbosity 5 is disabled", func() {
+			debugCalls := 0
+			dev := partitionDevice("sda1", "data_01")
+			dev.debugFn = func() string {
+				debugCalls++
+				return "expensive debug output"
+			}
+
+			Expect(scatter.added(dev)).To(Succeed())
+			Expect(debugCalls).To(BeZero())
+		})
+	})
+
+	Describe("initialization staging", func() {
+		It("builds matching resources without registering them", func() {
+			staged := &Scatter[*partition]{
+				templater:  PartitionLabelMatcherTemplater("ydb.tech", matcher),
+				mapper:     PartitionLabelMatcherInstances("ydb.tech", matcher, false),
+				registry:   &Registry{},
+				routes:     make(map[ResourceTemplate]Resource),
+				registered: make(map[ResourceTemplate]bool),
+			}
+			DeferCleanup(func() {
+				for _, res := range staged.routes {
+					res.Close()
+				}
+			})
+
+			Expect(staged.InitDevice(partitionDevice("nvme0n1p1", "nvme_disk01"))).To(Succeed())
+			Expect(staged.routes).To(HaveLen(1))
+			Expect(staged.registered).To(BeEmpty())
+		})
 	})
 
 	Describe("removed with an existing route", func() {

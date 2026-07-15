@@ -1,6 +1,10 @@
 package plugin
 
 import (
+	"errors"
+	"fmt"
+	"sort"
+
 	"k8s.io/klog/v2"
 
 	"github.com/ydb-platform/udev-manager/internal/mux"
@@ -11,57 +15,112 @@ import (
 // [Resource] instances as matching devices are added or removed. Each unique
 // ResourceTemplate produced by the templater gets its own Resource.
 type Scatter[T Instance] struct {
-	templater FromDevice[*ResourceTemplate]
-	mapper    FromDevice[[]T]
-	registry  *Registry
-	routes    map[ResourceTemplate]Resource
+	templater  FromDevice[*ResourceTemplate]
+	mapper     FromDevice[[]T]
+	registry   *Registry
+	routes     map[ResourceTemplate]Resource
+	registered map[ResourceTemplate]bool
 }
 
-// NewScatter creates a [Scatter] that subscribes to d and routes matching
-// devices to resources via templater and mapper. It returns a CancelFunc that
-// unsubscribes and stops the scatter goroutine.
+// NewScatterHandler creates a handler that routes matching devices to
+// resources via templater and mapper. Initial resources are staged until all
+// configured handlers have processed the complete udev snapshot.
+func NewScatterHandler[T Instance](
+	registry *Registry,
+	templater FromDevice[*ResourceTemplate],
+	mapper FromDevice[[]T],
+) DeviceHandler {
+	return &Scatter[T]{
+		templater:  templater,
+		mapper:     mapper,
+		registry:   registry,
+		routes:     make(map[ResourceTemplate]Resource),
+		registered: make(map[ResourceTemplate]bool),
+	}
+}
+
+// NewScatter is retained for callers that need a single standalone scatter.
+// startApp uses RunDeviceHandlers so every configured scatter shares one udev
+// subscription and one initialization barrier.
 func NewScatter[T Instance](
 	d udev.Discovery,
 	registry *Registry,
 	templater FromDevice[*ResourceTemplate],
 	mapper FromDevice[[]T],
 ) mux.CancelFunc {
-	scatter := &Scatter[T]{
-		templater: templater,
-		mapper:    mapper,
-		registry:  registry,
-		routes:    make(map[ResourceTemplate]Resource),
-	}
-	ch := make(chan udev.Event, 1)
-
-	go scatter.run(ch)
-
-	return d.Subscribe(mux.SinkFromChan(ch))
+	handler := NewScatterHandler(registry, templater, mapper)
+	return RunDeviceHandlers(d, nil, handler)
 }
 
-func (s *Scatter[T]) added(dev udev.Device) {
+func (s *Scatter[T]) InitDevice(dev udev.Device) error {
+	return s.addedWithRegistration(dev, false)
+}
+
+func (s *Scatter[T]) InitComplete() error {
+	if s.registered == nil {
+		s.registered = make(map[ResourceTemplate]bool)
+	}
+
+	templates := make([]ResourceTemplate, 0, len(s.routes))
+	for template := range s.routes {
+		templates = append(templates, template)
+	}
+	sort.Slice(templates, func(i, j int) bool {
+		return s.routes[templates[i]].Name() < s.routes[templates[j]].Name()
+	})
+
+	var registrationErrors []error
+	for _, template := range templates {
+		if s.registered[template] {
+			continue
+		}
+		res := s.routes[template]
+		if err := s.registry.Add(res); err != nil {
+			registrationErrors = append(registrationErrors,
+				fmt.Errorf("failed to register resource %s: %w", res.Name(), err))
+			continue
+		}
+		s.registered[template] = true
+	}
+	return errors.Join(registrationErrors...)
+}
+
+func (s *Scatter[T]) Added(dev udev.Device) error {
+	return s.added(dev)
+}
+
+func (s *Scatter[T]) Removed(dev udev.Device) error {
+	return s.removed(dev)
+}
+
+func (s *Scatter[T]) added(dev udev.Device) error {
+	return s.addedWithRegistration(dev, true)
+}
+
+func (s *Scatter[T]) addedWithRegistration(dev udev.Device, register bool) error {
 	if dev == nil {
-		klog.Errorf("device is nil")
-		return
+		return errors.New("device is nil")
 	}
 	template, err := s.templater(dev)
 	if err != nil {
-		klog.Errorf("failed to create resource template for device %q, caused by %q", dev.Debug(), err.Error())
-		return
+		return fmt.Errorf("failed to create resource template for device %q: %w", dev.Debug(), err)
 	}
 
 	if template == nil {
-		klog.V(5).Infof("unmatched device: %q, template is nil", dev.Debug())
-		return
+		if klog.V(5).Enabled() {
+			klog.Infof("unmatched device: %q, template is nil", dev.Debug())
+		}
+		return nil
 	}
 
 	instances, err := s.mapper(dev)
 	if err != nil {
-		klog.Errorf("failed to map device %q to instances, caused by %q", dev.Debug(), err.Error())
-		return
+		return fmt.Errorf("failed to map device %q to instances: %w", dev.Debug(), err)
 	}
 
-	klog.V(5).Infof("Init: Matched device: %q", dev.Debug())
+	if klog.V(5).Enabled() {
+		klog.Infof("Matched device: %q", dev.Debug())
+	}
 
 	if res, ok := s.routes[*template]; ok {
 		klog.V(5).Infof("Init: Matched resource: %s", res.Name())
@@ -69,9 +128,9 @@ func (s *Scatter[T]) added(dev udev.Device) {
 			Instances: unpack(instances...),
 			Health:    Healthy{},
 		}); err != nil {
-			klog.Errorf("failed to submit health event for %s: %v", res.Name(), err)
+			return fmt.Errorf("failed to submit health event for %s: %w", res.Name(), err)
 		}
-		return
+		return nil
 	}
 
 	instanceMap := make(map[Id]Instance, len(instances))
@@ -80,38 +139,44 @@ func (s *Scatter[T]) added(dev udev.Device) {
 	}
 	res := newResource(*template, instanceMap)
 
-	err = s.registry.Add(res)
-	if err != nil {
-		klog.Errorf("failed to add resource %s: %v", res.Name(), err)
-		res.Close()
-		return
+	if register {
+		if err := s.registry.Add(res); err != nil {
+			res.Close()
+			return fmt.Errorf("failed to add resource %s: %w", res.Name(), err)
+		}
+		if s.registered == nil {
+			s.registered = make(map[ResourceTemplate]bool)
+		}
+		s.registered[*template] = true
 	}
 	s.routes[*template] = res
+	return nil
 }
 
-func (s *Scatter[T]) removed(dev udev.Device) {
+func (s *Scatter[T]) removed(dev udev.Device) error {
 	if dev == nil {
-		klog.Errorf("device is nil")
-		return
+		return errors.New("device is nil")
 	}
 	template, err := s.templater(dev)
 	if err != nil {
-		klog.Errorf("failed to create resource template for 'Removed' event for device %q, caused by %q", dev.Debug(), err.Error())
-		return
+		return fmt.Errorf("failed to create resource template for removed device %q: %w", dev.Debug(), err)
 	}
 
 	if template == nil {
-		klog.V(5).Infof("unmatched device: %q, template is nil", dev.Debug())
-		return
+		if klog.V(5).Enabled() {
+			klog.Infof("unmatched device: %q, template is nil", dev.Debug())
+		}
+		return nil
 	}
 
 	instances, err := s.mapper(dev)
 	if err != nil {
-		klog.Errorf("failed to map device %q to instances for 'Removed', caused by %q", dev.Debug(), err.Error())
-		return
+		return fmt.Errorf("failed to map removed device %q to instances: %w", dev.Debug(), err)
 	}
 
-	klog.V(5).Infof("Removed: Matched device: %q", dev.Debug())
+	if klog.V(5).Enabled() {
+		klog.Infof("Removed: Matched device: %q", dev.Debug())
+	}
 
 	if res, ok := s.routes[*template]; ok {
 		klog.V(5).Infof("Removed: Matched resource: %s", res.Name())
@@ -119,11 +184,12 @@ func (s *Scatter[T]) removed(dev udev.Device) {
 			Instances: unpack(instances...),
 			Health:    Unhealthy{},
 		}); err != nil {
-			klog.Errorf("failed to submit health event for %s: %v", res.Name(), err)
+			return fmt.Errorf("failed to submit health event for %s: %w", res.Name(), err)
 		}
 	} else {
-		klog.Errorf("failed to find resource for 'Removed' event for device %q", dev.Debug())
+		return fmt.Errorf("failed to find resource for removed device %q", dev.Debug())
 	}
+	return nil
 }
 
 func unpack[T Instance](instances ...T) []Instance {
@@ -139,12 +205,21 @@ func (s *Scatter[T]) run(evCh <-chan udev.Event) {
 		switch ev := ev.(type) {
 		case udev.Init:
 			for _, dev := range ev.Devices {
-				s.added(dev)
+				if err := s.InitDevice(dev); err != nil {
+					klog.Errorf("failed to initialize device %q: %v", deviceID(dev), err)
+				}
+			}
+			if err := s.InitComplete(); err != nil {
+				klog.Errorf("failed to publish initial resources: %v", err)
 			}
 		case udev.Added:
-			s.added(ev.Device)
+			if err := s.Added(ev.Device); err != nil {
+				klog.Errorf("failed to add device %q: %v", deviceID(ev.Device), err)
+			}
 		case udev.Removed:
-			s.removed(ev.Device)
+			if err := s.Removed(ev.Device); err != nil {
+				klog.Errorf("failed to remove device %q: %v", deviceID(ev.Device), err)
+			}
 		}
 	}
 }
