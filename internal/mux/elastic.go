@@ -29,11 +29,11 @@ type elasticSink[T any] struct {
 // the pathological case of a consumer that never drains; callers should only
 // use this for consumers that are guaranteed to make progress.
 //
-// Ordering is preserved. Close stops delivery, discards any values still
-// queued, and closes the wrapped sink; it never blocks waiting for the
-// consumer. Errors returned by the wrapped sink's Submit are reported to
-// logger (if non-nil) — they cannot be returned to the producer, which has
-// already moved on.
+// Ordering is preserved. Close stops accepting new values and discards any
+// values still queued. The wrapped sink is closed once the drain goroutine
+// observes the close; if the wrapped sink's Submit can block indefinitely,
+// close propagation may be delayed. Errors from the wrapped sink's Submit are
+// reported to logger (if non-nil) — they cannot be returned to the producer.
 func ElasticSink[T any](sink Sink[T], logger Logger) Sink[T] {
 	e := &elasticSink[T]{
 		sink:   sink,
