@@ -7,6 +7,89 @@ import (
 
 var errSinkClosed = errors.New("mux: sink is closed")
 
+const (
+	initialElasticQueueCapacity     = 16
+	maxRetainedElasticQueueCapacity = 1024
+)
+
+// ringQueue is a growable FIFO backed by a circular buffer. Unlike repeatedly
+// reslicing from the front, it reuses slots released by Pop and only copies
+// elements when the buffer has to grow.
+type ringQueue[T any] struct {
+	values []T
+	head   int
+	count  int
+}
+
+func (q *ringQueue[T]) len() int {
+	return q.count
+}
+
+func (q *ringQueue[T]) push(v T) {
+	if q.count == len(q.values) {
+		q.grow()
+	}
+
+	tail := q.head + q.count
+	if tail >= len(q.values) {
+		tail -= len(q.values)
+	}
+	q.values[tail] = v
+	q.count++
+}
+
+func (q *ringQueue[T]) pop() (T, bool) {
+	if q.count == 0 {
+		var zero T
+		return zero, false
+	}
+
+	v := q.values[q.head]
+	var zero T
+	q.values[q.head] = zero
+	q.head++
+	if q.head == len(q.values) {
+		q.head = 0
+	}
+	q.count--
+
+	if q.count == 0 {
+		q.head = 0
+		// Reuse normal burst capacity, but do not retain a pathological peak
+		// forever after the consumer catches up.
+		if len(q.values) > maxRetainedElasticQueueCapacity {
+			q.values = nil
+		}
+	}
+
+	return v, true
+}
+
+func (q *ringQueue[T]) clear() {
+	q.values = nil
+	q.head = 0
+	q.count = 0
+}
+
+func (q *ringQueue[T]) grow() {
+	capacity := len(q.values) * 2
+	if capacity < initialElasticQueueCapacity {
+		capacity = initialElasticQueueCapacity
+	}
+
+	values := make([]T, capacity)
+	if q.count > 0 {
+		if q.head+q.count <= len(q.values) {
+			copy(values, q.values[q.head:q.head+q.count])
+		} else {
+			n := copy(values, q.values[q.head:])
+			copy(values[n:], q.values[:q.count-n])
+		}
+	}
+	q.values = values
+	q.head = 0
+}
+
 // elasticSink decouples a producer from a slow consumer with an unbounded
 // FIFO queue. Submit appends to the queue and returns immediately; a
 // dedicated goroutine drains the queue into the wrapped sink in order.
@@ -14,7 +97,7 @@ type elasticSink[T any] struct {
 	sink Sink[T]
 
 	mu     sync.Mutex
-	queue  []T
+	queue  ringQueue[T]
 	closed bool
 	wake   chan struct{}
 	logger Logger
@@ -52,18 +135,12 @@ func (e *elasticSink[T]) run() {
 			e.sink.Close()
 			return
 		}
-		if len(e.queue) == 0 {
+		if e.queue.len() == 0 {
 			e.mu.Unlock()
 			<-e.wake
 			continue
 		}
-		v := e.queue[0]
-		var zero T
-		e.queue[0] = zero
-		e.queue = e.queue[1:]
-		if len(e.queue) == 0 {
-			e.queue = nil // let the backing array be collected
-		}
+		v, _ := e.queue.pop()
 		e.mu.Unlock()
 
 		if err := e.sink.Submit(v); err != nil && e.logger != nil {
@@ -78,7 +155,7 @@ func (e *elasticSink[T]) Submit(v T) error {
 		e.mu.Unlock()
 		return errSinkClosed
 	}
-	e.queue = append(e.queue, v)
+	e.queue.push(v)
 	e.mu.Unlock()
 
 	select {
@@ -95,7 +172,7 @@ func (e *elasticSink[T]) Close() {
 		return
 	}
 	e.closed = true
-	e.queue = nil
+	e.queue.clear()
 	e.mu.Unlock()
 
 	select {
