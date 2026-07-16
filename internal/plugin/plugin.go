@@ -22,6 +22,7 @@ import (
 type plugin struct {
 	resource  Resource
 	pluginDir string
+	ctx       context.Context
 	cancel    context.CancelFunc
 	stopped   chan struct{} // closed after gRPC server is fully stopped
 }
@@ -31,6 +32,7 @@ func newPlugin(resource Resource, ctx context.Context, wg *sync.WaitGroup, plugi
 	plugin := &plugin{
 		resource:  resource,
 		pluginDir: pluginDir,
+		ctx:       ctx,
 		cancel:    cancel,
 		stopped:   make(chan struct{}),
 	}

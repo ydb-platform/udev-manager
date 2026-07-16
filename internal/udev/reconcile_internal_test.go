@@ -1,8 +1,24 @@
 package udev
 
 import (
+	"sync"
 	"testing"
+	"time"
 )
+
+func TestNewDiscoveryRejectsNonPositiveReconcileInterval(t *testing.T) {
+	for _, interval := range []time.Duration{0, -time.Second} {
+		wg := &sync.WaitGroup{}
+		discovery, err := NewDiscovery(wg, WithReconcileInterval(interval))
+		if err == nil {
+			t.Fatalf("NewDiscovery(%s) returned no error", interval)
+		}
+		if discovery != nil {
+			t.Fatalf("NewDiscovery(%s) returned a non-nil discovery", interval)
+		}
+		wg.Wait()
+	}
+}
 
 func deviceSet(ids ...Id) map[Id]Device {
 	m := make(map[Id]Device, len(ids))

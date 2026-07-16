@@ -53,10 +53,6 @@ type stateRequest struct {
 
 func (r stateRequest) requestSealed() {}
 
-type stopRequest struct{}
-
-func (r stopRequest) requestSealed() {}
-
 type newSub struct {
 	sink mux.Sink[Event]
 }
@@ -227,6 +223,8 @@ func (s *udevSlice) Subscribe(sink mux.Sink[[]Device]) mux.CancelFunc {
 
 type udevDiscovery struct {
 	udev              libudev.Udev
+	ctx               context.Context
+	cancel            context.CancelFunc
 	mu                sync.RWMutex
 	state             map[Id]Device
 	requests          chan mux.AwaitReply[monitorRequest, any]
@@ -239,9 +237,9 @@ type udevDiscovery struct {
 // DiscoveryOption configures a Discovery created by [NewDiscovery].
 type DiscoveryOption func(*udevDiscovery)
 
-// defaultReconcileInterval bounds how long a lost udev event can keep the
+// DefaultReconcileInterval bounds how long a lost udev event can keep the
 // discovery state out of sync with sysfs.
-const defaultReconcileInterval = 60 * time.Second
+const DefaultReconcileInterval = 60 * time.Second
 
 // monitorReceiveBufferSize is the kernel socket buffer requested for the udev
 // netlink monitor. The default (~208KB) overflows during boot-time coldplug
@@ -265,18 +263,28 @@ func WithReconcileInterval(interval time.Duration) DiscoveryOption {
 // every reconcile interval and emits synthetic Added/Removed events for any
 // drift it finds.
 func NewDiscovery(wg *sync.WaitGroup, opts ...DiscoveryOption) (Discovery, error) {
+	ctx, cancel := context.WithCancel(context.Background())
 	d := &udevDiscovery{
 		state:             make(map[Id]Device),
 		requests:          make(chan mux.AwaitReply[monitorRequest, any]),
-		mux:               mux.Make[Event](),
+		ctx:               ctx,
+		cancel:            cancel,
 		wg:                wg,
 		done:              make(chan struct{}),
-		reconcileInterval: defaultReconcileInterval,
+		reconcileInterval: DefaultReconcileInterval,
 	}
 
 	for _, opt := range opts {
 		opt(d)
 	}
+	if d.reconcileInterval <= 0 {
+		cancel()
+		return nil, fmt.Errorf("reconcile interval must be positive, got %s", d.reconcileInterval)
+	}
+
+	// Start the mux only after option validation so an invalid configuration
+	// does not leak its goroutine.
+	d.mux = mux.Make[Event]()
 
 	wg.Add(1)
 	go d.monitor(wg)
@@ -285,12 +293,8 @@ func NewDiscovery(wg *sync.WaitGroup, opts ...DiscoveryOption) (Discovery, error
 }
 
 func (d *udevDiscovery) Close() {
-	await := mux.NewAwaitReply[monitorRequest, any](stopRequest{})
-	select {
-	case d.requests <- await:
-		await.Await()
-	case <-d.done:
-	}
+	d.cancel()
+	<-d.done
 }
 
 // State returns the current state of the devices as seen by the monitor
@@ -430,7 +434,37 @@ func (d *udevDiscovery) newMonitor() (<-chan *libudev.Device, <-chan error, erro
 		}
 	}
 
-	return mon.DeviceChan(context.Background())
+	return mon.DeviceChan(d.ctx)
+}
+
+// newMonitorWithRetry opens a monitor, retrying transient setup failures while
+// the discovery is alive. Making the delay context-aware keeps Close prompt
+// even when udev is unavailable.
+func (d *udevDiscovery) newMonitorWithRetry() (<-chan *libudev.Device, <-chan error, error) {
+	for {
+		if err := d.ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+
+		devChan, errChan, err := d.newMonitor()
+		if err == nil {
+			return devChan, errChan, nil
+		}
+		klog.Errorf("Failed to create device channel, retrying: %v", err)
+
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-timer.C:
+		case <-d.ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, nil, d.ctx.Err()
+		}
+	}
 }
 
 // applyEnumeration reconciles state with the set of devices found by an
@@ -492,27 +526,30 @@ func (d *udevDiscovery) reconcile() {
 		}
 	}
 
-	for _, dev := range added {
-		if err := d.mux.Submit(Added{dev}); err != nil {
-			klog.Errorf("reconcile: failed to submit Added event: %v", err)
-		}
-	}
+	// Publish removals before additions. If a device is replaced at a new
+	// syspath but maps to the same resource instance, this ensures the new
+	// instance's Healthy update wins instead of the stale removal leaving it
+	// Unhealthy.
 	for _, dev := range removed {
 		if err := d.mux.Submit(Removed{dev}); err != nil {
 			klog.Errorf("reconcile: failed to submit Removed event: %v", err)
+		}
+	}
+	for _, dev := range added {
+		if err := d.mux.Submit(Added{dev}); err != nil {
+			klog.Errorf("reconcile: failed to submit Added event: %v", err)
 		}
 	}
 }
 
 func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 	defer wg.Done()
-	defer d.mux.Close()
 	defer close(d.done)
+	defer d.mux.Close()
 
 	// Step 1: open the monitor socket so the kernel starts buffering events.
-	devChan, errChan, err := d.newMonitor()
+	devChan, errChan, err := d.newMonitorWithRetry()
 	if err != nil {
-		klog.Errorf("Failed to create device channel: %v", err)
 		return
 	}
 
@@ -527,7 +564,18 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 	// Step 3: process buffered and future events.
 	for {
 		select {
-		case dev := <-devChan:
+		case <-d.ctx.Done():
+			return
+		case dev, ok := <-devChan:
+			if !ok {
+				klog.Warning("udev: monitor device channel closed, reconnecting")
+				devChan, errChan, err = d.newMonitorWithRetry()
+				if err != nil {
+					return
+				}
+				d.reconcile()
+				continue
+			}
 			klog.V(5).Infof("Received device event (%s): %s", dev.Action(), dev.Syspath())
 			switch dev.Action() {
 			case ActionAdd, ActionOnline:
@@ -581,24 +629,18 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 				}
 				cancel := d.mux.Subscribe(r.sink)
 				req.Reply(cancel)
-			case stopRequest:
-				req.Reply(nil)
-				return
 			}
 		case <-reconcileTicker.C:
 			d.reconcile()
 		case err, ok := <-errChan:
 			if !ok {
-				klog.Errorf("udev: monitor error channel closed")
-				return
+				klog.Warning("udev: monitor error channel closed, reconnecting")
+			} else {
+				klog.Errorf("Error from udev monitor, reconnecting: %v", err)
 			}
-			klog.Errorf("Error from udev monitor, will try to retry connecting to udev: %v", err)
-		retry:
-			devChan, errChan, err = d.newMonitor()
+			devChan, errChan, err = d.newMonitorWithRetry()
 			if err != nil {
-				klog.Errorf("Failed to create device channel, retrying: %v", err)
-				time.Sleep(1 * time.Second)
-				goto retry
+				return
 			}
 			klog.Infof("Successfully reconnected to udev")
 			// Events emitted while the monitor was down are gone; resync.

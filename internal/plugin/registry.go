@@ -21,6 +21,7 @@ import (
 // It is responsible for (re-)registering plugins with the kubelet.
 type Registry struct {
 	plugins       sync.Map
+	pluginsMu     sync.Mutex
 	ctx           context.Context
 	wg            *sync.WaitGroup
 	watcher       *fsnotify.Watcher
@@ -60,7 +61,11 @@ func (r *Registry) register(plugin *plugin) error {
 
 	client := pluginapi.NewRegistrationClient(conn)
 
-	ctx, cancel := context.WithTimeout(r.ctx, 10*time.Second)
+	// Tie the RPC to the plugin instance as well as the registry. A kubelet
+	// restart replaces plugins while the registry itself remains alive; using
+	// only r.ctx would let an old registration attempt linger for the full
+	// timeout and potentially race the replacement.
+	ctx, cancel := context.WithTimeout(plugin.ctx, 10*time.Second)
 	defer cancel()
 
 	_, err = client.Register(ctx, &pluginapi.RegisterRequest{
@@ -92,6 +97,12 @@ const (
 func (r *Registry) registerWithRetry(plugin *plugin) {
 	backoff := registerBackoffInitial
 	for attempt := 1; ; attempt++ {
+		select {
+		case <-plugin.stopped:
+			return
+		default:
+		}
+
 		err := r.register(plugin)
 		if err == nil {
 			return
@@ -126,6 +137,9 @@ func (r *Registry) registerAsync(plugin *plugin) {
 // Newely started kubelet removes all socket files, so we need to re-register
 // all plugins. See https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#handling-kubelet-restarts
 func (r *Registry) hup() {
+	r.pluginsMu.Lock()
+	defer r.pluginsMu.Unlock()
+
 	r.plugins.Range(func(key, p interface{}) bool {
 		old := p.(*plugin)
 		old.stop()
@@ -236,18 +250,25 @@ func (r *Registry) Healthz(resp http.ResponseWriter, req *http.Request) {
 // backoff, so a kubelet that is briefly unavailable (e.g. restarting at the
 // same time as this plugin) does not cost the resource permanently.
 func (r *Registry) Add(resource Resource) error {
+	r.pluginsMu.Lock()
+	defer r.pluginsMu.Unlock()
+
+	// Check before creating the Unix listener. newPlugin removes any socket at
+	// the resource's path, so discovering a duplicate afterward would unlink
+	// the live plugin and make it unreachable even though Add returned an
+	// error.
+	if _, loaded := r.plugins.Load(resource.Name()); loaded {
+		klog.Errorf("resource with name %q already exists", resource.Name())
+		return fmt.Errorf("resource with name %q already exists", resource.Name())
+	}
+
 	plugin, err := newPlugin(resource, r.ctx, r.wg, r.pluginDir)
 	if err != nil {
 		klog.Errorf("failed to create plugin for resource %q Cause: %v", resource.Name(), err)
 		return err
 	}
 
-	_, loaded := r.plugins.LoadOrStore(resource.Name(), plugin)
-	if loaded {
-		klog.Errorf("resource with name %q already exists", resource.Name())
-		plugin.stop()
-		return fmt.Errorf("resource with name %q already exists", resource.Name())
-	}
+	r.plugins.Store(resource.Name(), plugin)
 	r.registerAsync(plugin)
 	return nil
 }
