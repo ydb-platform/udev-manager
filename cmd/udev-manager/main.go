@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -34,7 +35,10 @@ func main() {
 	flags := initFlags()
 
 	// udev discovery looks up devices and listens for system events
-	devDiscovery, err := udev.NewDiscovery(appWaitGroup)
+	devDiscovery, err := udev.NewDiscovery(
+		appWaitGroup,
+		udev.WithReconcileInterval(time.Duration(*flags.config.ReconcileInterval)),
+	)
 	if err != nil {
 		klog.Fatalf("failed to start udev discovery: %v", err)
 		os.Exit(1)
@@ -405,6 +409,24 @@ type numaAffinityConfig struct {
 	DomainOverride string `yaml:"domain,omitempty"`
 }
 
+// yamlDuration accepts Go duration strings such as "30s" or "2m". A custom
+// type prevents an unqualified YAML integer from being interpreted as
+// nanoseconds and accidentally turning reconciliation into a tight loop.
+type yamlDuration time.Duration
+
+func (d *yamlDuration) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode || node.Tag != "!!str" {
+		return fmt.Errorf("must be a duration string such as 30s or 2m")
+	}
+
+	duration, err := time.ParseDuration(node.Value)
+	if err != nil {
+		return fmt.Errorf("must be a valid duration: %w", err)
+	}
+	*d = yamlDuration(duration)
+	return nil
+}
+
 func (nac *numaAffinityConfig) validate() error {
 	if nac.Name == "" {
 		return fmt.Errorf(".name: must not be empty")
@@ -430,6 +452,7 @@ type appConfig struct {
 	DeviceDomain         string                  `yaml:"domain"`
 	DisableTopologyHints bool                    `yaml:"disable_topology_hints"`
 	HealthCheckPort      uint16                  `yaml:"health_check_port"`
+	ReconcileInterval    *yamlDuration           `yaml:"reconcile_interval"`
 	Partitions           []partitionsConfig      `yaml:"partitions"`
 	BatchPartitions      []batchPartitionsConfig `yaml:"batchPartitions"`
 	HostDevs             []hostDevConfig         `yaml:"hostdevs"`
@@ -449,6 +472,13 @@ func (c *appConfig) validate() error {
 	}
 	if c.HealthCheckPort == 0 {
 		c.HealthCheckPort = defaultHealthcheckPort
+	}
+	if c.ReconcileInterval == nil {
+		defaultInterval := yamlDuration(udev.DefaultReconcileInterval)
+		c.ReconcileInterval = &defaultInterval
+	}
+	if *c.ReconcileInterval <= 0 {
+		errs = errors.Join(errs, fmt.Errorf(".reconcile_interval: must be positive, got %s", time.Duration(*c.ReconcileInterval)))
 	}
 
 	// Validate partitions

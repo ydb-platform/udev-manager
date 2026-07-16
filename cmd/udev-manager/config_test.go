@@ -2,6 +2,7 @@ package main
 
 import (
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -58,6 +59,43 @@ domain: ydb.tech
 health_check_port: 9090
 `)
 		Expect(cfg.HealthCheckPort).To(BeEquivalentTo(9090))
+	})
+
+	It("defaults reconcile_interval to one minute", func() {
+		cfg := mustParseYAML(minimalValidConfig)
+		Expect(time.Duration(*cfg.ReconcileInterval)).To(Equal(time.Minute))
+	})
+
+	It("parses an explicit reconcile_interval", func() {
+		cfg := mustParseYAML(`
+domain: ydb.tech
+reconcile_interval: 15s
+`)
+		Expect(time.Duration(*cfg.ReconcileInterval)).To(Equal(15 * time.Second))
+	})
+
+	It("rejects a negative reconcile_interval", func() {
+		_, err := parseYAML(`
+domain: ydb.tech
+reconcile_interval: -1s
+`)
+		Expect(err).To(MatchError(ContainSubstring(".reconcile_interval")))
+	})
+
+	It("rejects a zero reconcile_interval", func() {
+		_, err := parseYAML(`
+domain: ydb.tech
+reconcile_interval: 0s
+`)
+		Expect(err).To(MatchError(ContainSubstring(".reconcile_interval")))
+	})
+
+	It("rejects a numeric reconcile_interval", func() {
+		_, err := parseYAML(`
+domain: ydb.tech
+reconcile_interval: 15
+`)
+		Expect(err).To(MatchError(ContainSubstring("duration string")))
 	})
 
 	It("accepts disable_topology_hints flag", func() {
