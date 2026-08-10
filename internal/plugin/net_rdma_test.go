@@ -48,6 +48,19 @@ var _ = Describe("NetRdmaMatcherTemplater", func() {
 	})
 })
 
+var _ = Describe("NetRdmaMatcherInstances", func() {
+	It("returns an error when the RDMA device lookup fails", func() {
+		const ifname = "rdma-interface-that-cannot-exist"
+		matcher := regexp.MustCompile(`.*`)
+		dev := netDevice(ifname, "100000", "up")
+
+		instances, err := NetRdmaMatcherInstances("ydb.tech", matcher, 1)(dev)
+
+		Expect(err).To(MatchError(ContainSubstring(`get RDMA device for network interface "` + ifname + `"`)))
+		Expect(instances).To(BeNil())
+	})
+})
+
 var _ = Describe("netRdma", func() {
 	Describe("Id", func() {
 		It("returns ifname_idx format", func() {

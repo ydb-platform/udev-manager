@@ -28,19 +28,13 @@ type Device interface {
 	Debug() string
 }
 
-// Event is the sealed interface for udev events. The concrete types are
-// [Init], [Added], and [Removed].
+// Event is a state mutation accepted by [FakeDiscovery.Emit]. Production
+// discovery does not publish these edge-triggered values; subscribers receive
+// authoritative [Snapshot] values instead. Its concrete types are [Added] and
+// [Removed].
 type Event interface {
 	eventSealed()
 }
-
-// Init is the first event delivered to a new subscriber. It carries the
-// full set of devices that existed at subscription time.
-type Init struct {
-	Devices []Device
-}
-
-func (Init) eventSealed() {}
 
 // Added is emitted when a new device appears in the system.
 type Added struct {
@@ -56,6 +50,15 @@ type Removed struct {
 
 func (Removed) eventSealed() {}
 
+// Snapshot is an authoritative view produced by one successful udev
+// enumeration. Generation increases on every successful pass, including
+// passes whose device set is unchanged. Consumers may safely skip intermediate
+// snapshots and process only the newest generation.
+type Snapshot struct {
+	Generation uint64
+	Devices    []Device
+}
+
 // Slice is a filtered, live view of the device set. Subscribers receive a
 // fresh []Device snapshot every time the matching set changes.
 type Slice interface {
@@ -63,9 +66,10 @@ type Slice interface {
 }
 
 // Discovery is the top-level interface for device enumeration and monitoring.
-// Subscribe delivers an [Init] snapshot followed by [Added]/[Removed] events.
+// Subscribe immediately delivers the latest authoritative [Snapshot], then
+// subsequent snapshots produced by event-triggered or periodic reconciliation.
 type Discovery interface {
-	mux.Source[Event]
+	mux.Source[Snapshot]
 	DeviceById(Id) Device
 	State(mux.FilterFunc[Device]) map[Id]Device
 	Slice(mux.FilterFunc[Device]) Slice

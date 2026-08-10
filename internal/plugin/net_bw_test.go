@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"time"
+
+	"github.com/ydb-platform/udev-manager/internal/udev"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -64,11 +67,35 @@ var _ = Describe("NetBWMatcherInstances", func() {
 		Expect(instances).To(BeNil())
 	})
 
-	It("returns nil when the speed attribute is empty", func() {
+	It("returns an error when the speed attribute cannot be read", func() {
 		matcher := regexp.MustCompile(`eth.*`)
 		dev := netDevice("eth0", "", "up")
 		instances, err := NetBWMatcherInstances("ydb.tech", matcher, 100)(dev)
-		Expect(err).NotTo(HaveOccurred())
+		Expect(err).To(MatchError(ContainSubstring(`network interface "eth0" has no "speed" attribute`)))
+		Expect(instances).To(BeNil())
+	})
+
+	It("returns an error when the speed attribute is malformed", func() {
+		matcher := regexp.MustCompile(`eth.*`)
+		dev := netDevice("eth0", "not-a-number", "up")
+		instances, err := NetBWMatcherInstances("ydb.tech", matcher, 100)(dev)
+		Expect(err).To(MatchError(ContainSubstring(`parse "eth0" speed "not-a-number"`)))
+		Expect(instances).To(BeNil())
+	})
+
+	It("returns an error when the speed is reported as unavailable", func() {
+		matcher := regexp.MustCompile(`eth.*`)
+		dev := netDevice("eth0", "-1", "up")
+		instances, err := NetBWMatcherInstances("ydb.tech", matcher, 100)(dev)
+		Expect(err).To(MatchError(ContainSubstring(`network interface "eth0" has invalid speed -1 Mbps`)))
+		Expect(instances).To(BeNil())
+	})
+
+	It("returns an error instead of panicking when bandwidth per share is zero", func() {
+		matcher := regexp.MustCompile(`eth.*`)
+		dev := netDevice("eth0", "1000", "up")
+		instances, err := NetBWMatcherInstances("ydb.tech", matcher, 0)(dev)
+		Expect(err).To(MatchError("bandwidth per share must be positive"))
 		Expect(instances).To(BeNil())
 	})
 
@@ -96,6 +123,38 @@ var _ = Describe("NetBWMatcherInstances", func() {
 		for i, inst := range instances {
 			Expect(string(inst.Id())).To(Equal(fmt.Sprintf("eth0_%d", i)))
 		}
+	})
+
+	It("leaves the last good resource state intact after a transient speed read failure", func() {
+		matcher := regexp.MustCompile(`eth(.*)`)
+		template := ResourceTemplate{Domain: "ydb.tech", Prefix: "netbw-0"}
+		goodDev := netDevice("eth0", "100", "up")
+		instances, err := NetBWMatcherInstances("ydb.tech", matcher, 100)(goodDev)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(instances).To(HaveLen(1))
+
+		res := newResource(template, map[Id]Instance{instances[0].Id(): instances[0]})
+		DeferCleanup(res.Close)
+		ctx, cancel := context.WithCancel(context.Background())
+		DeferCleanup(cancel)
+		updates := res.Watch(ctx)
+		Eventually(updates).Should(Receive()) // initial state
+
+		scatter := &Scatter[*networkBandwidth]{
+			templater: NetBWMatcherTemplater("ydb.tech", matcher),
+			mapper:    NetBWMatcherInstances("ydb.tech", matcher, 100),
+			routes:    map[ResourceTemplate]Resource{template: res},
+			known:     make(map[ResourceTemplate]map[Id]Instance),
+		}
+		badDev := netDevice("eth0", "", "up")
+		scatter.applySnapshot(udev.Snapshot{Generation: 2, Devices: []udev.Device{badDev}})
+
+		Expect(res.Devices()).To(ConsistOf(And(
+			HaveField("ID", "eth0_0"),
+			HaveField("Health", "Healthy"),
+		)))
+		Expect(baseInstance(res.Instances()["eth0_0"]).(*networkBandwidth).dev).To(BeIdenticalTo(goodDev))
+		Consistently(updates, 50*time.Millisecond).ShouldNot(Receive())
 	})
 })
 

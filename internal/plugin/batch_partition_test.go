@@ -11,6 +11,18 @@ import (
 	"github.com/ydb-platform/udev-manager/internal/udev"
 )
 
+func batchPartitionPoolForTest(domain string, devices ...udev.Device) *batchPartitionPool {
+	parts, labels := batchPartitionState(
+		udev.Snapshot{Devices: devices},
+		regexp.MustCompile(`.*`),
+	)
+	return &batchPartitionPool{
+		parts:  parts,
+		labels: labels,
+		domain: domain,
+	}
+}
+
 var _ = Describe("matchBatchPartitionDevice", func() {
 	var matcher *regexp.Regexp
 
@@ -75,11 +87,6 @@ var _ = Describe("batchPartitionPool", func() {
 	var dev1, dev2 *mockDevice
 
 	BeforeEach(func() {
-		pool = &batchPartitionPool{
-			parts:  make(map[udev.Id]udev.Device),
-			labels: make(map[udev.Id]string),
-			domain: "ydb.tech",
-		}
 		dev1 = partitionDevice("nvme0n1p1", "nvme_data_01")
 		dev1.sysattrs = map[string]string{
 			udev.SysAttrWWID:  "wwid1",
@@ -90,6 +97,7 @@ var _ = Describe("batchPartitionPool", func() {
 			udev.SysAttrWWID:  "wwid2",
 			udev.SysAttrModel: "NVMe SSD",
 		}
+		pool = batchPartitionPoolForTest("ydb.tech")
 	})
 
 	Describe("health", func() {
@@ -98,7 +106,7 @@ var _ = Describe("batchPartitionPool", func() {
 		})
 
 		It("returns Healthy when the pool has at least one device", func() {
-			pool.add(dev1, "nvme_data_01")
+			pool = batchPartitionPoolForTest("ydb.tech", dev1)
 			Expect(pool.health()).To(BeAssignableToTypeOf(Healthy{}))
 		})
 	})
@@ -108,36 +116,21 @@ var _ = Describe("batchPartitionPool", func() {
 			Expect(pool.empty()).To(BeTrue())
 		})
 
-		It("returns false after a device is added", func() {
-			pool.add(dev1, "nvme_data_01")
+		It("returns false for a generation with a device", func() {
+			pool = batchPartitionPoolForTest("ydb.tech", dev1)
 			Expect(pool.empty()).To(BeFalse())
-		})
-
-		It("returns true again after the last device is removed", func() {
-			pool.add(dev1, "nvme_data_01")
-			pool.remove(dev1.Id())
-			Expect(pool.empty()).To(BeTrue())
 		})
 	})
 
-	Describe("add and remove", func() {
-		It("increases pool size on add", func() {
-			pool.add(dev1, "nvme_data_01")
-			Expect(pool.parts).To(HaveLen(1))
-		})
+	Describe("generation isolation", func() {
+		It("does not mutate an older pool when a new one is built", func() {
+			oldPool := batchPartitionPoolForTest("ydb.tech", dev1)
+			newPool := batchPartitionPoolForTest("ydb.tech", dev2)
 
-		It("adding the same device twice is idempotent", func() {
-			pool.add(dev1, "nvme_data_01")
-			pool.add(dev1, "nvme_data_01")
-			Expect(pool.parts).To(HaveLen(1))
-		})
-
-		It("removes only the specified device", func() {
-			pool.add(dev1, "nvme_data_01")
-			pool.add(dev2, "nvme_data_02")
-			pool.remove(dev1.Id())
-			Expect(pool.parts).To(HaveLen(1))
-			Expect(pool.parts).To(HaveKey(dev2.Id()))
+			Expect(oldPool.parts).To(HaveKey(dev1.Id()))
+			Expect(oldPool.parts).NotTo(HaveKey(dev2.Id()))
+			Expect(newPool.parts).To(HaveKey(dev2.Id()))
+			Expect(newPool.parts).NotTo(HaveKey(dev1.Id()))
 		})
 	})
 
@@ -150,7 +143,7 @@ var _ = Describe("batchPartitionPool", func() {
 		})
 
 		It("returns one device spec for a single device in the pool", func() {
-			pool.add(dev1, "nvme_data_01")
+			pool = batchPartitionPoolForTest("ydb.tech", dev1)
 			resp, err := pool.allocate(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.Devices).To(HaveLen(1))
@@ -159,15 +152,14 @@ var _ = Describe("batchPartitionPool", func() {
 		})
 
 		It("returns merged device specs for multiple devices", func() {
-			pool.add(dev1, "nvme_data_01")
-			pool.add(dev2, "nvme_data_02")
+			pool = batchPartitionPoolForTest("ydb.tech", dev1, dev2)
 			resp, err := pool.allocate(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.Devices).To(HaveLen(2))
 		})
 
 		It("sets env vars for each partition using the partition label", func() {
-			pool.add(dev1, "nvme_data_01")
+			pool = batchPartitionPoolForTest("ydb.tech", dev1)
 			resp, err := pool.allocate(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.Envs).To(HaveKey("YDB_TECH_PART_NVME_DATA_01_PATH"))
@@ -180,11 +172,7 @@ var _ = Describe("batchPartitionSeat", func() {
 	var seat *batchPartitionSeat
 
 	BeforeEach(func() {
-		pool = &batchPartitionPool{
-			parts:  make(map[udev.Id]udev.Device),
-			labels: make(map[udev.Id]string),
-			domain: "ydb.tech",
-		}
+		pool = batchPartitionPoolForTest("ydb.tech")
 		seat = &batchPartitionSeat{id: "0", pool: pool}
 	})
 
@@ -197,7 +185,10 @@ var _ = Describe("batchPartitionSeat", func() {
 	})
 
 	It("is Healthy when the pool has a device", func() {
-		pool.add(partitionDevice("nvme0n1p1", "nvme_data"), "nvme_data")
+		seat.pool = batchPartitionPoolForTest(
+			"ydb.tech",
+			partitionDevice("nvme0n1p1", "nvme_data"),
+		)
 		Expect(seat.Health()).To(BeAssignableToTypeOf(Healthy{}))
 	})
 
@@ -206,7 +197,10 @@ var _ = Describe("batchPartitionSeat", func() {
 	})
 
 	It("delegates Allocate to the pool", func() {
-		pool.add(partitionDevice("nvme0n1p1", "nvme_data"), "nvme_data")
+		seat.pool = batchPartitionPoolForTest(
+			"ydb.tech",
+			partitionDevice("nvme0n1p1", "nvme_data"),
+		)
 		resp, err := seat.Allocate(context.Background())
 		Expect(err).NotTo(HaveOccurred())
 		Expect(resp.Devices).To(HaveLen(1))
@@ -214,181 +208,130 @@ var _ = Describe("batchPartitionSeat", func() {
 })
 
 var _ = Describe("newResource Close", func() {
-	It("stops the run goroutine and closes instanceCh", func() {
-		// Simulates what happens when registry.Add fails and res.Close() is called:
-		// the eagerly-started goroutine must exit cleanly.
+	It("closes resource watchers", func() {
 		res := newResource(
 			ResourceTemplate{Domain: "ydb.tech", Prefix: "batch-test"},
 			map[Id]Instance{},
 		)
-		ch := res.ListAndWatch(context.Background())
-		Eventually(ch).Should(Receive()) // drain initial snapshot
+		updates := res.Watch(context.Background())
+		Eventually(updates).Should(Receive()) // initial token
 
 		res.Close()
-		Eventually(ch).Should(BeClosed())
+		Eventually(updates).Should(BeClosed())
 	})
 })
 
 var _ = Describe("runBatchPartitionScatter", func() {
 	var (
-		pool    *batchPartitionPool
-		res     *resource
-		seats   []Instance
-		evCh    chan udev.Event
-		matcher *regexp.Regexp
-		watchCh <-chan []Instance
+		res        *resource
+		snapshotCh chan udev.Snapshot
+		matcher    *regexp.Regexp
+		updates    <-chan struct{}
+		runDone    chan struct{}
 	)
 
 	BeforeEach(func() {
 		matcher = regexp.MustCompile(`nvme.*`)
-		pool = &batchPartitionPool{
-			parts:  make(map[udev.Id]udev.Device),
-			labels: make(map[udev.Id]string),
-			domain: "ydb.tech",
-		}
-		seat := &batchPartitionSeat{id: "0", pool: pool}
-		seats = []Instance{seat}
+		instances := batchPartitionInstances(udev.Snapshot{}, matcher, "ydb.tech", 1)
 		res = newResource(
 			ResourceTemplate{Domain: "ydb.tech", Prefix: "batch-nvme"},
-			map[Id]Instance{seat.Id(): seat},
+			instances,
 		)
 		DeferCleanup(res.Close)
 
-		watchCh = res.ListAndWatch(context.Background())
-		Eventually(watchCh).Should(Receive()) // drain initial snapshot
+		updates = res.Watch(context.Background())
+		Eventually(updates).Should(Receive()) // initial token
 
-		evCh = make(chan udev.Event, 10)
-		go runBatchPartitionScatter(evCh, pool, matcher, res, seats)
+		snapshotCh = make(chan udev.Snapshot, 10)
+		runDone = make(chan struct{})
+		go func() {
+			defer close(runDone)
+			runBatchPartitionScatter(snapshotCh, matcher, "ydb.tech", 1, res)
+		}()
 	})
 
 	AfterEach(func() {
-		close(evCh)
+		close(snapshotCh)
+		Eventually(runDone).Should(BeClosed())
 	})
 
-	Describe("Init event", func() {
-		It("populates the pool with all matching devices", func() {
-			dev1 := partitionDevice("nvme0n1p1", "nvme_data_01")
-			dev2 := partitionDevice("nvme1n1p1", "nvme_data_02")
-			dev3 := partitionDevice("sda1", "data_01") // non-matching
-			evCh <- udev.Init{Devices: []udev.Device{dev1, dev2, dev3}}
+	It("atomically replaces the pool with all matching devices", func() {
+		dev1 := partitionDevice("nvme0n1p1", "nvme_data_01")
+		dev2 := partitionDevice("nvme1n1p1", "nvme_data_02")
+		dev3 := partitionDevice("sda1", "data_01")
+		snapshotCh <- udev.Snapshot{Generation: 1, Devices: []udev.Device{dev1, dev2, dev3}}
 
-			Eventually(func() int {
-				pool.mu.RLock()
-				defer pool.mu.RUnlock()
-				return len(pool.parts)
-			}).Should(Equal(2))
-		})
-
-		It("emits a health event when matching devices are found", func() {
-			dev := partitionDevice("nvme0n1p1", "nvme_data_01")
-			evCh <- udev.Init{Devices: []udev.Device{dev}}
-			Eventually(watchCh).Should(Receive())
-		})
-
-		It("does not emit a health event when no matching devices are found", func() {
-			dev := partitionDevice("sda1", "data_01")
-			evCh <- udev.Init{Devices: []udev.Device{dev}}
-			Consistently(watchCh, 50*time.Millisecond).ShouldNot(Receive())
-		})
-
-		It("emits only one health event for multiple matching devices in Init", func() {
-			dev1 := partitionDevice("nvme0n1p1", "nvme_data_01")
-			dev2 := partitionDevice("nvme1n1p1", "nvme_data_02")
-			evCh <- udev.Init{Devices: []udev.Device{dev1, dev2}}
-			Eventually(watchCh).Should(Receive())
-			Consistently(watchCh, 50*time.Millisecond).ShouldNot(Receive())
-		})
+		Eventually(func() int {
+			seat := res.Instances()[Id("0")].(*batchPartitionSeat)
+			return len(seat.pool.parts)
+		}).Should(Equal(2))
+		Eventually(updates).Should(Receive())
+		Consistently(updates, 50*time.Millisecond).ShouldNot(Receive())
 	})
 
-	Describe("Added event", func() {
-		It("adds a matching device to the pool", func() {
-			dev := partitionDevice("nvme0n1p1", "nvme_data_01")
-			evCh <- udev.Added{Device: dev}
-			Eventually(func() bool { return !pool.empty() }).Should(BeTrue())
-		})
+	It("swaps fresh seats without mutating the previous healthy generation", func() {
+		dev1 := partitionDevice("nvme0n1p1", "nvme_data_01")
+		snapshotCh <- udev.Snapshot{Generation: 1, Devices: []udev.Device{dev1}}
+		Eventually(updates).Should(Receive())
+		oldSeat := res.Instances()[Id("0")].(*batchPartitionSeat)
 
-		It("emits a health event on the empty-to-non-empty transition", func() {
-			dev := partitionDevice("nvme0n1p1", "nvme_data_01")
-			evCh <- udev.Added{Device: dev}
-			Eventually(watchCh).Should(Receive())
-		})
+		dev2 := partitionDevice("nvme1n1p1", "nvme_data_02")
+		snapshotCh <- udev.Snapshot{Generation: 2, Devices: []udev.Device{dev2}}
+		var newSeat *batchPartitionSeat
+		Eventually(func() bool {
+			newSeat = res.Instances()[Id("0")].(*batchPartitionSeat)
+			return newSeat != oldSeat
+		}).Should(BeTrue())
 
-		It("does not emit a health event when the pool was already non-empty", func() {
-			dev1 := partitionDevice("nvme0n1p1", "nvme_data_01")
-			dev2 := partitionDevice("nvme1n1p1", "nvme_data_02")
-			evCh <- udev.Added{Device: dev1}
-			Eventually(watchCh).Should(Receive()) // drain the first transition
+		Expect(oldSeat.pool).NotTo(BeIdenticalTo(newSeat.pool))
+		Expect(oldSeat.pool.parts).To(HaveKey(dev1.Id()))
+		Expect(oldSeat.pool.parts).NotTo(HaveKey(dev2.Id()))
+		Expect(newSeat.pool.parts).To(HaveKey(dev2.Id()))
+		Expect(newSeat.pool.parts).NotTo(HaveKey(dev1.Id()))
 
-			evCh <- udev.Added{Device: dev2}
-			Consistently(watchCh, 50*time.Millisecond).ShouldNot(Receive())
-		})
-
-		It("ignores non-matching devices", func() {
-			dev := partitionDevice("sda1", "data_01")
-			evCh <- udev.Added{Device: dev}
-			Consistently(func() bool { return pool.empty() }, 50*time.Millisecond).Should(BeTrue())
-			Consistently(watchCh, 50*time.Millisecond).ShouldNot(Receive())
-		})
+		oldResponse, err := oldSeat.Allocate(context.Background())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(oldResponse.Devices).To(ConsistOf(HaveField("HostPath", "/dev/nvme0n1p1")))
+		newResponse, err := newSeat.Allocate(context.Background())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(newResponse.Devices).To(ConsistOf(HaveField("HostPath", "/dev/nvme1n1p1")))
+		Consistently(updates, 50*time.Millisecond).ShouldNot(Receive())
 	})
 
-	// Regression: udevDiscovery has a TOCTOU between NewEnumerate and
-	// NewMonitorFromNetlink. A device added in that gap is never recorded
-	// in state, so its later removal produces Removed{nil}.
-	Describe("nil device from TOCTOU gap", func() {
-		It("does not panic on Added with nil device", func() {
-			evCh <- udev.Added{Device: nil}
-			// Fence: send a valid event afterward and wait for it to be processed,
-			// proving the nil event was handled without crashing.
-			dev := partitionDevice("nvme0n1p1", "nvme_data_01")
-			evCh <- udev.Added{Device: dev}
-			Eventually(func() bool { return !pool.empty() }).Should(BeTrue())
-		})
+	It("does not notify while a fresh generation remains healthy", func() {
+		dev1 := partitionDevice("nvme0n1p1", "nvme_data_01")
+		dev2 := partitionDevice("nvme1n1p1", "nvme_data_02")
+		snapshotCh <- udev.Snapshot{Generation: 1, Devices: []udev.Device{dev1}}
+		Eventually(updates).Should(Receive())
+		oldSeat := res.Instances()[Id("0")].(*batchPartitionSeat)
 
-		It("does not panic on Removed with nil device", func() {
-			evCh <- udev.Removed{Device: nil}
-			// Fence: send a valid event afterward and wait for it to be processed.
-			dev := partitionDevice("nvme0n1p1", "nvme_data_01")
-			evCh <- udev.Added{Device: dev}
-			Eventually(func() bool { return !pool.empty() }).Should(BeTrue())
-		})
+		snapshotCh <- udev.Snapshot{Generation: 2, Devices: []udev.Device{dev1, dev2}}
+		var newSeat *batchPartitionSeat
+		Eventually(func() bool {
+			newSeat = res.Instances()[Id("0")].(*batchPartitionSeat)
+			return newSeat != oldSeat && len(newSeat.pool.parts) == 2
+		}).Should(BeTrue())
+		Expect(oldSeat.pool.parts).To(HaveLen(1))
+		Consistently(updates, 50*time.Millisecond).ShouldNot(Receive())
 	})
 
-	Describe("Removed event", func() {
-		BeforeEach(func() {
-			// Seed the pool with one matching device.
-			dev := partitionDevice("nvme0n1p1", "nvme_data_01")
-			evCh <- udev.Added{Device: dev}
-			Eventually(watchCh).Should(Receive()) // drain the Healthy event
-		})
+	It("publishes an empty generation without changing an in-flight old seat", func() {
+		dev := partitionDevice("nvme0n1p1", "nvme_data_01")
+		snapshotCh <- udev.Snapshot{Generation: 1, Devices: []udev.Device{dev}}
+		Eventually(updates).Should(Receive())
+		oldSeat := res.Instances()[Id("0")].(*batchPartitionSeat)
 
-		It("removes a matching device from the pool", func() {
-			dev := partitionDevice("nvme0n1p1", "nvme_data_01")
-			evCh <- udev.Removed{Device: dev}
-			Eventually(func() bool { return pool.empty() }).Should(BeTrue())
-		})
+		snapshotCh <- udev.Snapshot{Generation: 2}
+		Eventually(updates).Should(Receive())
+		newSeat := res.Instances()[Id("0")].(*batchPartitionSeat)
+		Expect(newSeat).NotTo(BeIdenticalTo(oldSeat))
+		Expect(newSeat.pool).NotTo(BeIdenticalTo(oldSeat.pool))
+		Expect(newSeat.pool.empty()).To(BeTrue())
+		Expect(res.Devices()).To(ConsistOf(HaveField("Health", "Unhealthy")))
 
-		It("emits a health event when the pool becomes empty", func() {
-			dev := partitionDevice("nvme0n1p1", "nvme_data_01")
-			evCh <- udev.Removed{Device: dev}
-			Eventually(watchCh).Should(Receive())
-		})
-
-		It("does not emit a health event when the pool still has devices", func() {
-			dev2 := partitionDevice("nvme1n1p1", "nvme_data_02")
-			evCh <- udev.Added{Device: dev2}
-			// pool: dev1 + dev2; no health event (was already non-empty)
-			Consistently(watchCh, 50*time.Millisecond).ShouldNot(Receive())
-
-			// Remove dev1; pool still has dev2, so no event
-			dev1 := partitionDevice("nvme0n1p1", "nvme_data_01")
-			evCh <- udev.Removed{Device: dev1}
-			Consistently(watchCh, 50*time.Millisecond).ShouldNot(Receive())
-		})
-
-		It("ignores Removed events for non-matching devices", func() {
-			dev := partitionDevice("sda1", "data_01")
-			evCh <- udev.Removed{Device: dev}
-			Consistently(watchCh, 50*time.Millisecond).ShouldNot(Receive())
-		})
+		Expect(oldSeat.Health()).To(BeAssignableToTypeOf(Healthy{}))
+		oldResponse, err := oldSeat.Allocate(context.Background())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(oldResponse.Devices).To(ConsistOf(HaveField("HostPath", "/dev/nvme0n1p1")))
 	})
 })

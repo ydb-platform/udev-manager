@@ -83,15 +83,21 @@ func NetBWMatcherInstances(domain string, matcher *regexp.Regexp, mbpsPerShare u
 		if !matcher.MatchString(ifname) {
 			return nil, nil
 		}
+		if mbpsPerShare == 0 {
+			return nil, fmt.Errorf("bandwidth per share must be positive")
+		}
 
 		speedString := dev.SystemAttribute(udev.SysAttrSpeed)
 		if speedString == "" {
-			return nil, nil
+			return nil, fmt.Errorf("network interface %q has no %q attribute", ifname, udev.SysAttrSpeed)
 		}
 
 		speedMbps, err := strconv.Atoi(speedString)
 		if err != nil {
-			return nil, nil
+			return nil, fmt.Errorf("parse %q speed %q: %w", ifname, speedString, err)
+		}
+		if speedMbps <= 0 {
+			return nil, fmt.Errorf("network interface %q has invalid speed %d Mbps", ifname, speedMbps)
 		}
 
 		shares := speedMbps / int(mbpsPerShare)

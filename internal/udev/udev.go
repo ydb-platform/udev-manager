@@ -3,6 +3,7 @@ package udev
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,7 +55,7 @@ type stateRequest struct {
 func (r stateRequest) requestSealed() {}
 
 type newSub struct {
-	sink mux.Sink[Event]
+	sink mux.Sink[Snapshot]
 }
 
 func (n newSub) requestSealed() {}
@@ -211,27 +212,33 @@ func (s *udevSlice) Close() {
 // goroutine, which is the sole owner of state, so there is no window where an
 // update could be missed or delivered twice.
 func (s *udevSlice) Subscribe(sink mux.Sink[[]Device]) mux.CancelFunc {
+	latest := mux.LatestSink(sink)
 	replyCh := make(chan mux.CancelFunc)
 	select {
-	case s.subscribeC <- subscribeReq{sink: sink, reply: replyCh}:
+	case s.subscribeC <- subscribeReq{sink: latest, reply: replyCh}:
 		return <-replyCh
 	case <-s.done:
-		sink.Close()
+		latest.Close()
 		return func() {}
 	}
 }
 
 type udevDiscovery struct {
 	udev              libudev.Udev
+	monitorUdev       libudev.Udev
 	ctx               context.Context
 	cancel            context.CancelFunc
 	mu                sync.RWMutex
 	state             map[Id]Device
 	requests          chan mux.AwaitReply[monitorRequest, any]
-	mux               *mux.Mux[Event]
+	mux               *mux.Mux[Snapshot]
 	wg                *sync.WaitGroup
-	done              chan struct{} // closed when monitor exits
+	done              chan struct{} // closed when the reconciliation controller exits
+	eventsDone        chan struct{} // closed when the netlink pump exits
+	monitorReady      chan struct{} // closed after the first monitor socket is listening
+	reconcileC        chan struct{} // capacity-one dirty notification
 	reconcileInterval time.Duration
+	generation        uint64
 }
 
 // DiscoveryOption configures a Discovery created by [NewDiscovery].
@@ -240,6 +247,8 @@ type DiscoveryOption func(*udevDiscovery)
 // DefaultReconcileInterval bounds how long a lost udev event can keep the
 // discovery state out of sync with sysfs.
 const DefaultReconcileInterval = 60 * time.Second
+
+const reconcileRetryInterval = time.Second
 
 // monitorReceiveBufferSize is the kernel socket buffer requested for the udev
 // netlink monitor. The default (~208KB) overflows during boot-time coldplug
@@ -253,15 +262,14 @@ func WithReconcileInterval(interval time.Duration) DiscoveryOption {
 	return func(d *udevDiscovery) { d.reconcileInterval = interval }
 }
 
-// NewDiscovery creates a real udev-backed Discovery. It starts a monitor
-// goroutine that opens the netlink socket, enumerates current devices, and
-// then processes events. The socket is opened before enumeration so the
-// kernel buffers events during the scan, eliminating the TOCTOU window.
+// NewDiscovery creates a real udev-backed Discovery. Netlink notifications
+// only trigger reconciliation; they never mutate discovery state directly.
+// A successful enumeration replaces the authoritative state and publishes one
+// full Snapshot. The socket is opened before the initial enumeration so an
+// event arriving during a scan schedules a trailing pass.
 //
-// Because netlink events can still be lost (kernel socket overflow, monitor
-// reconnects, slow consumers), the monitor additionally re-enumerates devices
-// every reconcile interval and emits synthetic Added/Removed events for any
-// drift it finds.
+// Periodic reconciliation remains as a repair path for netlink overflow and
+// monitor outages.
 func NewDiscovery(wg *sync.WaitGroup, opts ...DiscoveryOption) (Discovery, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &udevDiscovery{
@@ -271,6 +279,9 @@ func NewDiscovery(wg *sync.WaitGroup, opts ...DiscoveryOption) (Discovery, error
 		cancel:            cancel,
 		wg:                wg,
 		done:              make(chan struct{}),
+		eventsDone:        make(chan struct{}),
+		monitorReady:      make(chan struct{}),
+		reconcileC:        make(chan struct{}, 1),
 		reconcileInterval: DefaultReconcileInterval,
 	}
 
@@ -284,9 +295,10 @@ func NewDiscovery(wg *sync.WaitGroup, opts ...DiscoveryOption) (Discovery, error
 
 	// Start the mux only after option validation so an invalid configuration
 	// does not leak its goroutine.
-	d.mux = mux.Make[Event]()
+	d.mux = mux.Make[Snapshot]()
 
-	wg.Add(1)
+	wg.Add(2)
+	go d.monitorEvents(wg)
 	go d.monitor(wg)
 
 	return d, nil
@@ -295,6 +307,7 @@ func NewDiscovery(wg *sync.WaitGroup, opts ...DiscoveryOption) (Discovery, error
 func (d *udevDiscovery) Close() {
 	d.cancel()
 	<-d.done
+	<-d.eventsDone
 }
 
 // State returns the current state of the devices as seen by the monitor
@@ -318,14 +331,13 @@ func (d *udevDiscovery) Slice(filter mux.FilterFunc[Device]) Slice {
 	return makeSlice(d, filter)
 }
 
-// makeSlice creates a Slice backed by any event Source. It subscribes to src
-// (receiving an Init followed by Add/Remove events), applies filter, and
-// publishes the current matching device set to downstream subscribers each
-// time the set changes.
+// makeSlice creates a Slice backed by authoritative discovery snapshots. It
+// replaces its filtered state on every generation and publishes only when the
+// matching device set changes.
 //
 // Slice.Subscribe replays the current state to every new subscriber so callers
 // always receive a consistent snapshot before any subsequent updates.
-func makeSlice(src mux.Source[Event], filter mux.FilterFunc[Device]) Slice {
+func makeSlice(src mux.Source[Snapshot], filter mux.FilterFunc[Device]) Slice {
 	slice := &udevSlice{
 		state:      make(map[Id]Device),
 		filter:     filter,
@@ -334,40 +346,39 @@ func makeSlice(src mux.Source[Event], filter mux.FilterFunc[Device]) Slice {
 		done:       make(chan struct{}),
 	}
 
-	evCh := make(chan Event)
+	snapshotCh := make(chan Snapshot)
+	ready := make(chan struct{})
 
 	go func() {
 		defer close(slice.done)
 		defer slice.mux.Close()
+		initialized := false
 		for {
 			select {
-			case ev, ok := <-evCh:
+			case snapshot, ok := <-snapshotCh:
 				if !ok {
 					return
 				}
-				switch e := ev.(type) {
-				case Init:
-					for _, dev := range e.Devices {
-						if filter(dev) {
-							slice.state[dev.Id()] = dev
-						}
+				next := make(map[Id]Device)
+				for _, dev := range snapshot.Devices {
+					if filter(dev) {
+						next[dev.Id()] = dev
 					}
-					if err := slice.mux.Submit(sliceSnapshot(slice.state)); err != nil {
-						klog.Errorf("slice: failed to submit Init snapshot: %v", err)
-					}
-				case Added:
-					if filter(e.Device) {
-						slice.state[e.Id()] = e.Device
-						if err := slice.mux.Submit(sliceSnapshot(slice.state)); err != nil {
-							klog.Errorf("slice: failed to submit Added snapshot: %v", err)
-						}
-					}
-				case Removed:
-					if _, found := slice.state[e.Id()]; found {
-						delete(slice.state, e.Id())
-						if err := slice.mux.Submit(sliceSnapshot(slice.state)); err != nil {
-							klog.Errorf("slice: failed to submit Removed snapshot: %v", err)
-						}
+				}
+				membershipChanged := !initialized || !sameDeviceState(slice.state, next)
+				initialized = true
+				slice.state = next
+				if !membershipChanged {
+					continue
+				}
+				if err := slice.mux.Submit(sliceSnapshot(slice.state)); err != nil {
+					klog.Errorf("slice: failed to submit snapshot generation %d: %v", snapshot.Generation, err)
+				}
+				if initialized {
+					select {
+					case <-ready:
+					default:
+						close(ready)
 					}
 				}
 
@@ -377,29 +388,38 @@ func makeSlice(src mux.Source[Event], filter mux.FilterFunc[Device]) Slice {
 				// no update can arrive between the two steps, so the subscriber
 				// cannot miss a snapshot or receive one out of order.
 				cancel := slice.mux.Subscribe(req.sink)
-				// Replay the current snapshot via a goroutine to avoid
-				// deadlocking when the sink wraps an unbuffered channel.
-				// We send the reply first so the subscriber starts reading,
-				// then wait for the replay to complete before processing
-				// the next event (preserving snapshot ordering).
 				snapshot := sliceSnapshot(slice.state)
-				replayDone := make(chan struct{})
-				go func() {
-					defer close(replayDone)
-					if err := req.sink.Submit(snapshot); err != nil {
-						klog.Errorf("slice: failed to replay snapshot to new subscriber: %v", err)
-					}
-				}()
+				if err := req.sink.Submit(snapshot); err != nil {
+					klog.Errorf("slice: failed to replay snapshot to new subscriber: %v", err)
+				}
 				req.reply <- cancel
-				<-replayDone
 			}
 		}
 	}()
 
-	evSink := mux.SinkFromChan(evCh)
-	slice.stop = src.Subscribe(evSink)
+	slice.stop = src.Subscribe(mux.SinkFromChan(snapshotCh))
+	select {
+	case <-ready:
+	case <-slice.done:
+	}
 
 	return slice
+}
+
+// sameDeviceState compares filtered set membership. Discovery replaces Device
+// objects on every enumeration, so pointer equality would turn every periodic
+// pass into a spurious Slice update. Plugin projection consumes Discovery
+// snapshots directly and therefore still refreshes metadata at retained IDs.
+func sameDeviceState(a, b map[Id]Device) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for id := range a {
+		if _, ok := b[id]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // sliceSnapshot returns a stable copy of the device map as a slice.
@@ -419,8 +439,11 @@ func sliceSnapshot(state map[Id]Device) []Device {
 // list when adding a resource type backed by another subsystem. Devices in
 // other subsystems still show up via enumeration (State / reconcile), but
 // their add/remove events are not delivered.
-func (d *udevDiscovery) newMonitor() (<-chan *libudev.Device, <-chan error, error) {
-	mon := d.udev.NewMonitorFromNetlink("udev")
+func (d *udevDiscovery) newMonitor(ctx context.Context) (<-chan *libudev.Device, <-chan error, error) {
+	// go-udev serializes every operation on one Udev context. Use a separate
+	// context for monitoring so a potentially slow enumeration cannot prevent
+	// the DeviceChan goroutine from draining the netlink socket.
+	mon := d.monitorUdev.NewMonitorFromNetlink("udev")
 
 	// Best effort: needs CAP_NET_ADMIN; without it we run with the default
 	// buffer and rely on filters + reconciliation.
@@ -434,25 +457,123 @@ func (d *udevDiscovery) newMonitor() (<-chan *libudev.Device, <-chan error, erro
 		}
 	}
 
-	return mon.DeviceChan(d.ctx)
+	return mon.DeviceChan(ctx)
 }
 
 // newMonitorWithRetry opens a monitor, retrying transient setup failures while
 // the discovery is alive. Making the delay context-aware keeps Close prompt
 // even when udev is unavailable.
-func (d *udevDiscovery) newMonitorWithRetry() (<-chan *libudev.Device, <-chan error, error) {
+func (d *udevDiscovery) newMonitorWithRetry(ctx context.Context) (<-chan *libudev.Device, <-chan error, error) {
 	for {
-		if err := d.ctx.Err(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
 
-		devChan, errChan, err := d.newMonitor()
+		devChan, errChan, err := d.newMonitor(ctx)
 		if err == nil {
 			return devChan, errChan, nil
 		}
 		klog.Errorf("Failed to create device channel, retrying: %v", err)
 
 		timer := time.NewTimer(time.Second)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, nil, ctx.Err()
+		}
+	}
+}
+
+// enumerationDelta counts key-level additions and removals for diagnostics.
+// Metadata changes at a retained syspath are intentionally not classified
+// here: every successful pass replaces the Device object and publishes the
+// complete snapshot, so downstream projection observes those changes too.
+func enumerationDelta(current, next map[Id]Device) (added, removed int) {
+	for id := range next {
+		if _, ok := current[id]; !ok {
+			added++
+		}
+	}
+	for id := range current {
+		if _, ok := next[id]; !ok {
+			removed++
+		}
+	}
+	return added, removed
+}
+
+func deviceSnapshot(state map[Id]Device) []Device {
+	devices := make([]Device, 0, len(state))
+	for _, dev := range state {
+		devices = append(devices, dev)
+	}
+	sort.Slice(devices, func(i, j int) bool { return devices[i].Id() < devices[j].Id() })
+	return devices
+}
+
+// reconcile performs the only discovery-state transition in production. A
+// successful enumeration atomically replaces state and publishes one complete
+// snapshot. Publishing every successful pass (not only key changes) refreshes
+// same-syspath metadata and lets downstream consumers retry failed projection
+// without relying on another edge event.
+func (d *udevDiscovery) reconcile() bool {
+	enum := d.udev.NewEnumerate()
+	devs, err := enum.Devices()
+	if err != nil {
+		klog.Errorf("reconcile: failed to enumerate devices: %v", err)
+		return false
+	}
+
+	found := make(map[Id]Device, len(devs))
+	for _, dev := range devs {
+		if dev == nil {
+			// Treat a nil entry as a failed/partial enumeration. Committing the
+			// remainder could turn an observation error into mass removals.
+			klog.Error("reconcile: enumeration returned a nil device; retaining previous state")
+			return false
+		}
+		found[Id(dev.Syspath())] = &generic{
+			udev: d,
+			dev:  dev,
+		}
+	}
+
+	d.mu.Lock()
+	added, removed := enumerationDelta(d.state, found)
+	d.state = found
+	d.generation++
+	snapshot := Snapshot{
+		Generation: d.generation,
+		Devices:    deviceSnapshot(d.state),
+	}
+	d.mu.Unlock()
+
+	if added > 0 || removed > 0 {
+		klog.V(4).Infof("reconcile: generation %d changed device keys: %d additions, %d removals", snapshot.Generation, added, removed)
+	}
+
+	if err := d.mux.Submit(snapshot); err != nil {
+		klog.Errorf("reconcile: failed to publish snapshot generation %d: %v", snapshot.Generation, err)
+	}
+	return true
+}
+
+// reconcileUntilSuccess obtains the initial authoritative snapshot. Requests
+// are not served before this succeeds because there is no last-good state to
+// return yet. Once initialized, runMonitor uses a timer-driven retry instead
+// so transient failures do not block State or Subscribe.
+func (d *udevDiscovery) reconcileUntilSuccess(reconcile func() bool, retryInterval time.Duration) bool {
+	for {
+		if reconcile() {
+			return true
+		}
+		timer := time.NewTimer(retryInterval)
 		select {
 		case <-timer.C:
 		case <-d.ctx.Done():
@@ -462,148 +583,171 @@ func (d *udevDiscovery) newMonitorWithRetry() (<-chan *libudev.Device, <-chan er
 				default:
 				}
 			}
-			return nil, nil, d.ctx.Err()
+			return false
 		}
 	}
 }
 
-// applyEnumeration reconciles state with the set of devices found by an
-// enumeration pass. Devices missing from state are inserted, devices no
-// longer present are deleted. It returns the devices that were added and
-// removed. Callers must hold no lock; state is the caller-owned map guarded
-// by d.mu in the discovery case.
-func applyEnumeration(state map[Id]Device, found map[Id]Device) (added, removed []Device) {
-	for id, dev := range found {
-		if _, ok := state[id]; !ok {
-			state[id] = dev
-			added = append(added, dev)
-		}
+func (d *udevDiscovery) signalReconcile() {
+	select {
+	case d.reconcileC <- struct{}{}:
+	default:
 	}
-	for id, dev := range state {
-		if _, ok := found[id]; !ok {
-			delete(state, id)
-			removed = append(removed, dev)
-		}
-	}
-	return added, removed
 }
 
-// reconcile re-enumerates all devices and repairs any drift between sysfs and
-// the tracked state, emitting synthetic Added/Removed events for the
-// difference. This bounds the damage of lost udev events (kernel socket
-// overflow, monitor reconnects): without it, a single lost event would leave
-// the advertised resources wrong until the process restarts.
-func (d *udevDiscovery) reconcile() {
-	enum := d.udev.NewEnumerate()
-	devs, err := enum.Devices()
-	if err != nil {
-		klog.Errorf("reconcile: failed to enumerate devices: %v", err)
-		return
-	}
+// monitorEvents owns the netlink monitor and continuously drains it while
+// enumeration runs in monitor. Event payloads are deliberately not applied to
+// state; every notification only marks reconciliation dirty. A capacity-one
+// signal coalesces bursts, and an event received during a scan leaves a token
+// for a trailing pass.
+func (d *udevDiscovery) monitorEvents(wg *sync.WaitGroup) {
+	defer wg.Done()
+	defer close(d.eventsDone)
 
-	found := make(map[Id]Device, len(devs))
-	for _, dev := range devs {
-		if dev == nil {
-			klog.Error("reconcile: udev device is nil!")
-			continue
+	firstMonitor := true
+	for {
+		sessionCtx, cancelSession := context.WithCancel(d.ctx)
+		devChan, errChan, err := d.newMonitorWithRetry(sessionCtx)
+		if err != nil {
+			cancelSession()
+			return
 		}
-		found[Id(dev.Syspath())] = &generic{
-			udev: d,
-			dev:  dev,
-		}
-	}
 
-	d.mu.Lock()
-	before := len(d.state)
-	added, removed := applyEnumeration(d.state, found)
-	d.mu.Unlock()
-
-	if len(added) > 0 || len(removed) > 0 {
-		if before == 0 && len(removed) == 0 {
-			klog.V(4).Infof("reconcile: initial enumeration found %d devices", len(added))
+		if firstMonitor {
+			close(d.monitorReady)
+			firstMonitor = false
 		} else {
-			klog.Warningf("reconcile: repaired state drift: %d missed additions, %d missed removals", len(added), len(removed))
+			klog.Infof("Successfully reconnected to udev; scheduling reconciliation")
+			d.signalReconcile()
 		}
-	}
 
-	// Publish removals before additions. If a device is replaced at a new
-	// syspath but maps to the same resource instance, this ensures the new
-	// instance's Healthy update wins instead of the stale removal leaving it
-	// Unhealthy.
-	for _, dev := range removed {
-		if err := d.mux.Submit(Removed{dev}); err != nil {
-			klog.Errorf("reconcile: failed to submit Removed event: %v", err)
+	monitorSession:
+		for {
+			select {
+			case <-d.ctx.Done():
+				cancelSession()
+				return
+			case dev, ok := <-devChan:
+				if !ok {
+					klog.Warning("udev: monitor device channel closed, reconnecting")
+					break monitorSession
+				}
+				if dev == nil {
+					klog.Warning("udev: monitor returned a nil device; scheduling reconciliation")
+				} else {
+					klog.V(5).Infof("Received device notification (%s): %s", dev.Action(), dev.Syspath())
+				}
+				d.signalReconcile()
+			case err, ok := <-errChan:
+				if !ok {
+					klog.Warning("udev: monitor error channel closed, reconnecting")
+				} else {
+					klog.Errorf("Error from udev monitor, reconnecting: %v", err)
+				}
+				break monitorSession
+			}
 		}
-	}
-	for _, dev := range added {
-		if err := d.mux.Submit(Added{dev}); err != nil {
-			klog.Errorf("reconcile: failed to submit Added event: %v", err)
-		}
+
+		cancelSession()
 	}
 }
 
+// monitor is the single reconciliation controller. It owns snapshot
+// publication and subscription ordering, so a new subscriber's initial replay
+// cannot be interleaved with a newer generation.
 func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
+	d.runMonitor(wg, d.reconcile, reconcileRetryInterval)
+}
+
+// runMonitor is split from monitor so the controller's retry and ordering
+// behavior can be tested without a live libudev context.
+func (d *udevDiscovery) runMonitor(wg *sync.WaitGroup, reconcile func() bool, retryInterval time.Duration) {
 	defer wg.Done()
 	defer close(d.done)
 	defer d.mux.Close()
 
-	// Step 1: open the monitor socket so the kernel starts buffering events.
-	devChan, errChan, err := d.newMonitorWithRetry()
-	if err != nil {
+	// The monitor socket must be listening before the initial enumeration. Any
+	// transition during that scan is then buffered by the pump and schedules a
+	// trailing pass.
+	select {
+	case <-d.monitorReady:
+	case <-d.ctx.Done():
 		return
 	}
-
-	// Step 2: enumerate current devices while events buffer in devChan.
-	// There are no subscribers yet, so the synthetic events go nowhere; this
-	// pass only populates the initial state.
-	d.reconcile()
+	if !d.reconcileUntilSuccess(reconcile, retryInterval) {
+		return
+	}
 
 	reconcileTicker := time.NewTicker(d.reconcileInterval)
 	defer reconcileTicker.Stop()
 
-	// Step 3: process buffered and future events.
+	var retryTimer *time.Timer
+	var retryC <-chan time.Time
+	stopRetry := func() {
+		if retryTimer == nil {
+			return
+		}
+		if !retryTimer.Stop() {
+			select {
+			case <-retryTimer.C:
+			default:
+			}
+		}
+		retryTimer = nil
+		retryC = nil
+	}
+	defer stopRetry()
+
+	scheduleRetry := func() {
+		if retryTimer != nil {
+			return
+		}
+		retryTimer = time.NewTimer(retryInterval)
+		retryC = retryTimer.C
+	}
+
+	// Every trigger starts one scan immediately. A newer trigger supersedes a
+	// scheduled retry; if that scan also fails, its retry interval starts from
+	// the latest failure. The controller remains in the select loop throughout
+	// the wait and can keep serving the last-good state.
+	reconcileOnce := func() {
+		stopRetry()
+		if !reconcile() {
+			scheduleRetry()
+		}
+	}
+
+	// If the first subscription request races with an event left pending by
+	// the initial enumeration (or with an expired retry timer), reconcile once
+	// before taking its snapshot. Dirty and retry notifications both describe
+	// the same desired operation, so they are coalesced into one bounded scan.
+	reconcilePending := func() {
+		pending := false
+		select {
+		case <-d.reconcileC:
+			pending = true
+		default:
+		}
+		select {
+		case <-retryC:
+			retryTimer = nil
+			retryC = nil
+			pending = true
+		default:
+		}
+		if pending {
+			reconcileOnce()
+		}
+	}
+
+	firstSubscriber := true
+
 	for {
 		select {
 		case <-d.ctx.Done():
 			return
-		case dev, ok := <-devChan:
-			if !ok {
-				klog.Warning("udev: monitor device channel closed, reconnecting")
-				devChan, errChan, err = d.newMonitorWithRetry()
-				if err != nil {
-					return
-				}
-				d.reconcile()
-				continue
-			}
-			klog.V(5).Infof("Received device event (%s): %s", dev.Action(), dev.Syspath())
-			switch dev.Action() {
-			case ActionAdd, ActionOnline:
-				id := Id(dev.Syspath())
-				dev := &generic{
-					udev: d,
-					dev:  dev,
-				}
-				d.mu.Lock()
-				d.state[id] = dev
-				d.mu.Unlock()
-				if err := d.mux.Submit(Added{dev}); err != nil {
-					klog.Errorf("udev: failed to submit Added event: %v", err)
-				}
-			case ActionRemove, ActionOffline:
-				id := Id(dev.Syspath())
-				d.mu.Lock()
-				dev, ok := d.state[id]
-				delete(d.state, id)
-				d.mu.Unlock()
-				if !ok {
-					klog.V(5).Infof("udev: ignoring Remove for unknown device %s", id)
-					continue
-				}
-				if err := d.mux.Submit(Removed{dev}); err != nil {
-					klog.Errorf("udev: failed to submit Removed event: %v", err)
-				}
-			}
+		case <-d.reconcileC:
+			reconcileOnce()
 		case req := <-d.requests:
 			switch r := req.Value().(type) {
 			case stateRequest:
@@ -617,62 +761,41 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 				d.mu.RUnlock()
 				req.Reply(state)
 			case newSub:
-				d.mu.RLock()
-				init := make([]Device, 0, len(d.state))
-				for _, dev := range d.state {
-					init = append(init, dev)
+				if firstSubscriber {
+					reconcilePending()
+					firstSubscriber = false
 				}
+				d.mu.RLock()
+				snapshot := Snapshot{Generation: d.generation, Devices: deviceSnapshot(d.state)}
 				d.mu.RUnlock()
-				err := r.sink.Submit(Init{init})
+				err := r.sink.Submit(snapshot)
 				if err != nil {
-					klog.Errorf("Failed to submit init event: %v", err)
+					klog.Errorf("Failed to submit initial snapshot: %v", err)
 				}
 				cancel := d.mux.Subscribe(r.sink)
 				req.Reply(cancel)
 			}
 		case <-reconcileTicker.C:
-			d.reconcile()
-		case err, ok := <-errChan:
-			if !ok {
-				klog.Warning("udev: monitor error channel closed, reconnecting")
-			} else {
-				klog.Errorf("Error from udev monitor, reconnecting: %v", err)
-			}
-			devChan, errChan, err = d.newMonitorWithRetry()
-			if err != nil {
-				return
-			}
-			klog.Infof("Successfully reconnected to udev")
-			// Events emitted while the monitor was down are gone; resync.
-			d.reconcile()
+			reconcileOnce()
+		case <-retryC:
+			retryTimer = nil
+			retryC = nil
+			reconcileOnce()
 		}
 	}
 }
 
-func (d *udevDiscovery) Subscribe(sink mux.Sink[Event]) mux.CancelFunc {
-	// here we're doing initialization in monitor goroutine
-	// to be able to pass consistent Init event to the sink
-	// before making fan out of udev events
-	//
-	// The sink is wrapped in an elastic buffer so that a slow consumer (e.g.
-	// a scatter blocked on kubelet registration for seconds) cannot
-	// back-pressure the fan-out: without it, one stalled subscriber causes
-	// the monitor's mux.Submit to time out and drop the event for every
-	// subscriber, permanently desynchronizing advertised resources.
-	elastic := mux.ElasticSink(sink, klogLogger{})
-	await := mux.NewAwaitReply[monitorRequest, any](newSub{elastic})
+func (d *udevDiscovery) Subscribe(sink mux.Sink[Snapshot]) mux.CancelFunc {
+	// Full snapshots are level-triggered, so a slow consumer only needs the
+	// newest pending generation. This bounded mailbox prevents one scatter from
+	// blocking discovery or growing an unbounded delta queue.
+	latest := mux.LatestSink(sink)
+	await := mux.NewAwaitReply[monitorRequest, any](newSub{latest})
 	select {
 	case d.requests <- await:
 		return await.Await().(mux.CancelFunc)
 	case <-d.done:
-		elastic.Close() // also closes the wrapped sink
+		latest.Close() // also closes the wrapped sink
 		return func() {}
 	}
-}
-
-// klogLogger adapts klog to the mux.Logger interface.
-type klogLogger struct{}
-
-func (klogLogger) Info(format string, args ...interface{}) {
-	klog.Infof(format, args...)
 }

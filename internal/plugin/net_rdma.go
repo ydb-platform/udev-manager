@@ -99,8 +99,7 @@ func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesCou
 
 		rdmaDevice, err := rdmamap.GetRdmaDeviceForNetdevice(ifname)
 		if err != nil {
-			klog.Errorf("fail to get rdma devices for network device: %s %v", ifname, err)
-			return nil, nil
+			return nil, fmt.Errorf("get RDMA device for network interface %q: %w", ifname, err)
 		}
 		rdmaCharDevices := rdmamap.GetRdmaCharDevices(rdmaDevice)
 		klog.Infof("found rdma character devices for ifname: %s devices: %v", ifname, rdmaCharDevices)

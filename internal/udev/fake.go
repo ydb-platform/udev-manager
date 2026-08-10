@@ -152,21 +152,22 @@ func (d *FakeDevice) Debug() string { return fmt.Sprintf("FakeDevice[%s]", d.id)
 // Discovery interface and can be passed wherever a real udev Discovery is
 // expected.
 type FakeDiscovery struct {
-	mu    sync.RWMutex
-	state map[Id]Device
-	m     *mux.Mux[Event]
+	mu         sync.RWMutex
+	state      map[Id]Device
+	generation uint64
+	m          *mux.Mux[Snapshot]
 }
 
 // NewFakeDiscovery creates a FakeDiscovery with an empty device state.
 func NewFakeDiscovery() *FakeDiscovery {
 	return &FakeDiscovery{
 		state: make(map[Id]Device),
-		m:     mux.Make[Event](),
+		m:     mux.Make[Snapshot](),
 	}
 }
 
 // AddDevice inserts dev into the discovery's state without emitting an event.
-// Call it before the first Subscribe so that the initial Init carries the
+// Call it before the first Subscribe so the initial Snapshot carries the
 // device to all new subscribers.
 func (f *FakeDiscovery) AddDevice(dev Device) {
 	f.mu.Lock()
@@ -174,10 +175,10 @@ func (f *FakeDiscovery) AddDevice(dev Device) {
 	f.state[dev.Id()] = dev
 }
 
-// Emit pushes ev to all current subscribers and updates the internal state:
-// Added events add the device, Removed events delete it. The state update and
-// event delivery are performed atomically under the lock to prevent races with
-// concurrent Subscribe calls.
+// Emit applies a test mutation, then publishes the resulting authoritative
+// snapshot. Added events add/replace a device and Removed events delete it.
+// Production discovery obtains the same result by re-enumerating sysfs rather
+// than applying the edge event itself.
 func (f *FakeDiscovery) Emit(ev Event) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -187,26 +188,29 @@ func (f *FakeDiscovery) Emit(ev Event) {
 	case Removed:
 		delete(f.state, e.Id())
 	}
-	_ = f.m.Submit(ev)
+	f.generation++
+	_ = f.m.Submit(Snapshot{
+		Generation: f.generation,
+		Devices:    deviceSnapshot(f.state),
+	})
 }
 
-// Subscribe delivers an [Init] event carrying the current device state to
-// sink, then subscribes it to all subsequent events. The returned [mux.CancelFunc]
-// unsubscribes sink.
+// Subscribe delivers the current authoritative snapshot, then subscribes sink
+// to subsequent generations. The returned [mux.CancelFunc] unsubscribes sink.
 //
-// The Init delivery and mux subscription are performed atomically under a
+// The initial delivery and mux subscription are performed atomically under a
 // write lock to prevent races with [Emit]. The sink must not block in Submit
 // (e.g., use a buffered channel) to avoid holding the lock.
-func (f *FakeDiscovery) Subscribe(sink mux.Sink[Event]) mux.CancelFunc {
-	// Hold the write lock across both the Init delivery and the mux
+func (f *FakeDiscovery) Subscribe(sink mux.Sink[Snapshot]) mux.CancelFunc {
+	latest := mux.LatestSink(sink)
+	// Hold the write lock across both the initial delivery and the mux
 	// subscription so that no Emit can interleave between the two steps.
 	f.mu.Lock()
-	devices := make([]Device, 0, len(f.state))
-	for _, dev := range f.state {
-		devices = append(devices, dev)
-	}
-	_ = sink.Submit(Init{Devices: devices})
-	cancel := f.m.Subscribe(sink)
+	_ = latest.Submit(Snapshot{
+		Generation: f.generation,
+		Devices:    deviceSnapshot(f.state),
+	})
+	cancel := f.m.Subscribe(latest)
 	f.mu.Unlock()
 	return cancel
 }

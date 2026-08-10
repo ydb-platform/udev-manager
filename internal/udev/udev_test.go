@@ -145,7 +145,7 @@ var _ = Describe("FakeDevice", func() {
 })
 
 // ---------------------------------------------------------------------------
-// FakeDiscovery — parent linkage through Init
+// FakeDiscovery — parent linkage through the initial snapshot
 // ---------------------------------------------------------------------------
 
 var _ = Describe("FakeDiscovery parent linkage", func() {
@@ -162,7 +162,7 @@ var _ = Describe("FakeDiscovery parent linkage", func() {
 	// In production, udev_enumerate_scan_devices returns devices sorted in
 	// dependency order (parents before children). The enumeration loop in
 	// monitor() relies on this to resolve parent references from d.state.
-	// This test verifies that the parent relationship survives Init delivery.
+	// This test verifies that the parent relationship survives initial snapshot delivery.
 	It("delivers child devices with their parent reference intact", func() {
 		parent := udev.NewFakeDevice("sysfs/nvme0").
 			WithSubsystem(udev.BlockSubsystem).
@@ -178,17 +178,17 @@ var _ = Describe("FakeDiscovery parent linkage", func() {
 		d.AddDevice(parent)
 		d.AddDevice(child)
 
-		ch := make(chan udev.Event, 4)
+		ch := make(chan udev.Snapshot, 4)
 		cancel := d.Subscribe(mux.SinkFromChan(ch))
 		defer cancel()
 
-		var initEvt udev.Event
-		Eventually(ch).Should(Receive(&initEvt))
+		var snapshot udev.Snapshot
+		Eventually(ch).Should(Receive(&snapshot))
 
-		devices := initEvt.(udev.Init).Devices
+		devices := snapshot.Devices
 		Expect(devices).To(HaveLen(2))
 
-		// Find the child in the Init snapshot and verify its parent.
+		// Find the child in the initial snapshot and verify its parent.
 		var found udev.Device
 		for _, dev := range devices {
 			if dev.Id() == "sysfs/nvme0n1p1" {
@@ -208,14 +208,14 @@ var _ = Describe("FakeDiscovery parent linkage", func() {
 
 		d.AddDevice(child)
 
-		ch := make(chan udev.Event, 4)
+		ch := make(chan udev.Snapshot, 4)
 		cancel := d.Subscribe(mux.SinkFromChan(ch))
 		defer cancel()
 
-		var initEvt udev.Event
-		Eventually(ch).Should(Receive(&initEvt))
+		var snapshot udev.Snapshot
+		Eventually(ch).Should(Receive(&snapshot))
 
-		devices := initEvt.(udev.Init).Devices
+		devices := snapshot.Devices
 		Expect(devices).To(HaveLen(1))
 		Expect(devices[0].Parent()).To(BeNil())
 	})
@@ -260,95 +260,100 @@ var _ = Describe("FakeDiscovery Subscribe", func() {
 		d.Close()
 	})
 
-	It("immediately delivers Init with an empty device list when state is empty", func() {
-		ch := make(chan udev.Event, 4)
+	It("immediately delivers an authoritative empty snapshot", func() {
+		ch := make(chan udev.Snapshot, 4)
 		cancel := d.Subscribe(mux.SinkFromChan(ch))
 		defer cancel()
 
-		Eventually(ch).Should(Receive(Equal(udev.Init{Devices: []udev.Device{}})))
+		Eventually(ch).Should(Receive(Equal(udev.Snapshot{Generation: 0, Devices: []udev.Device{}})))
 	})
 
-	It("immediately delivers Init carrying pre-populated devices", func() {
+	It("immediately delivers a snapshot carrying pre-populated devices", func() {
 		dev1 := blockPartition("nvme0n1p1", "data")
 		dev2 := blockPartition("nvme0n1p2", "log")
 		d.AddDevice(dev1)
 		d.AddDevice(dev2)
 
-		ch := make(chan udev.Event, 4)
+		ch := make(chan udev.Snapshot, 4)
 		cancel := d.Subscribe(mux.SinkFromChan(ch))
 		defer cancel()
 
 		Eventually(ch).Should(Receive(WithTransform(
-			func(ev udev.Event) []udev.Device { return ev.(udev.Init).Devices },
+			func(snapshot udev.Snapshot) []udev.Device { return snapshot.Devices },
 			ConsistOf(dev1, dev2),
 		)))
 	})
 
-	It("delivers Added events after the initial Init", func() {
-		ch := make(chan udev.Event, 4)
+	It("delivers the full state after an addition", func() {
+		ch := make(chan udev.Snapshot, 4)
 		cancel := d.Subscribe(mux.SinkFromChan(ch))
 		defer cancel()
 
-		// Drain Init.
-		Eventually(ch).Should(Receive(BeAssignableToTypeOf(udev.Init{})))
+		Eventually(ch).Should(Receive()) // initial snapshot
 
 		dev := blockPartition("nvme0n1p1", "data")
 		d.Emit(udev.Added{Device: dev})
 
-		Eventually(ch).Should(Receive(Equal(udev.Added{Device: dev})))
+		Eventually(ch).Should(Receive(And(
+			HaveField("Generation", uint64(1)),
+			HaveField("Devices", ConsistOf(dev)),
+		)))
 	})
 
-	It("delivers Removed events", func() {
+	It("delivers the full state after a removal", func() {
 		dev := blockPartition("nvme0n1p1", "data")
 		d.AddDevice(dev)
 
-		ch := make(chan udev.Event, 4)
+		ch := make(chan udev.Snapshot, 4)
 		cancel := d.Subscribe(mux.SinkFromChan(ch))
 		defer cancel()
 
-		// Drain Init.
-		Eventually(ch).Should(Receive(BeAssignableToTypeOf(udev.Init{})))
+		Eventually(ch).Should(Receive()) // initial snapshot
 
 		d.Emit(udev.Removed{Device: dev})
-		Eventually(ch).Should(Receive(Equal(udev.Removed{Device: dev})))
+		Eventually(ch).Should(Receive(And(
+			HaveField("Generation", uint64(1)),
+			HaveField("Devices", BeEmpty()),
+		)))
 	})
 
-	It("stops delivering events after CancelFunc is called", func() {
-		ch := make(chan udev.Event, 4)
+	It("stops delivering snapshots after CancelFunc is called", func() {
+		ch := make(chan udev.Snapshot, 4)
 		cancel := d.Subscribe(mux.SinkFromChan(ch))
 
-		// Drain Init.
-		Eventually(ch).Should(Receive(BeAssignableToTypeOf(udev.Init{})))
+		Eventually(ch).Should(Receive()) // initial snapshot
 
 		cancel()
 
 		// Use a second subscriber as a delivery barrier so we know the Emit
 		// has been fully processed before we assert the first sink is silent.
-		barrier := make(chan udev.Event, 4)
+		barrier := make(chan udev.Snapshot, 4)
 		barrierCancel := d.Subscribe(mux.SinkFromChan(barrier))
 		defer barrierCancel()
-		Eventually(barrier).Should(Receive(BeAssignableToTypeOf(udev.Init{})))
+		Eventually(barrier).Should(Receive()) // initial snapshot
 
 		dev := blockPartition("nvme0n1p1", "data")
 		d.Emit(udev.Added{Device: dev})
-		Eventually(barrier).Should(Receive(BeAssignableToTypeOf(udev.Added{})))
+		Eventually(barrier).Should(Receive(HaveField("Devices", ConsistOf(dev))))
 
 		Expect(ch).NotTo(Receive())
 	})
 
 	It("delivers to multiple independent subscribers", func() {
-		ch1 := make(chan udev.Event, 4)
-		ch2 := make(chan udev.Event, 4)
+		ch1 := make(chan udev.Snapshot, 4)
+		ch2 := make(chan udev.Snapshot, 4)
 		cancel1 := d.Subscribe(mux.SinkFromChan(ch1))
 		cancel2 := d.Subscribe(mux.SinkFromChan(ch2))
 		defer cancel1()
 		defer cancel2()
+		Eventually(ch1).Should(Receive())
+		Eventually(ch2).Should(Receive())
 
 		dev := blockPartition("nvme0n1p1", "data")
 		d.Emit(udev.Added{Device: dev})
 
-		Eventually(ch1).Should(Receive(BeAssignableToTypeOf(udev.Added{})))
-		Eventually(ch2).Should(Receive(BeAssignableToTypeOf(udev.Added{})))
+		Eventually(ch1).Should(Receive(HaveField("Devices", ConsistOf(dev))))
+		Eventually(ch2).Should(Receive(HaveField("Devices", ConsistOf(dev))))
 	})
 })
 
@@ -472,7 +477,7 @@ var _ = Describe("Slice", func() {
 		return ch, cancel
 	}
 
-	It("emits the current matching devices from Init", func() {
+	It("emits the current matching devices from the initial snapshot", func() {
 		dev1 := blockPartition("nvme0n1p1", "data")
 		dev2 := blockPartition("nvme0n1p2", "log")
 		d.AddDevice(dev1)
@@ -485,7 +490,7 @@ var _ = Describe("Slice", func() {
 		Eventually(ch).Should(Receive(ConsistOf(dev1, dev2)))
 	})
 
-	It("emits an empty slice from Init when no devices match the filter", func() {
+	It("emits an empty slice from the initial snapshot when no devices match the filter", func() {
 		// Only a net device pre-populated — isBlock filter should exclude it.
 		net := udev.NewFakeDevice("eth0").WithSubsystem(udev.NetSubsystem)
 		d.AddDevice(net)
@@ -503,7 +508,7 @@ var _ = Describe("Slice", func() {
 		ch, cancel := subscribeSlice(s)
 		defer cancel()
 
-		Eventually(ch).Should(Receive()) // consume Init snapshot
+		Eventually(ch).Should(Receive()) // consume initial snapshot
 
 		dev := blockPartition("nvme0n1p1", "data")
 		d.Emit(udev.Added{Device: dev})
@@ -516,7 +521,7 @@ var _ = Describe("Slice", func() {
 		ch, cancel := subscribeSlice(s)
 		defer cancel()
 
-		Eventually(ch).Should(Receive(BeEmpty())) // replayed empty Init
+		Eventually(ch).Should(Receive(BeEmpty())) // replayed empty initial snapshot
 
 		// Add a non-matching (net) device — slice must not emit.
 		net := udev.NewFakeDevice("eth0").WithSubsystem(udev.NetSubsystem)
@@ -557,7 +562,7 @@ var _ = Describe("Slice", func() {
 		ch, cancel := subscribeSlice(s)
 		defer cancel()
 
-		Eventually(ch).Should(Receive(ConsistOf(dev))) // replayed Init with dev
+		Eventually(ch).Should(Receive(ConsistOf(dev))) // replayed initial snapshot with dev
 
 		// Remove a device that was never tracked (wrong subsystem).
 		net := udev.NewFakeDevice("eth0").WithSubsystem(udev.NetSubsystem)
@@ -578,7 +583,7 @@ var _ = Describe("Slice", func() {
 		ch, cancel := subscribeSlice(s)
 		defer cancel()
 
-		Eventually(ch).Should(Receive()) // consume empty Init
+		Eventually(ch).Should(Receive()) // consume empty initial snapshot
 
 		dev := blockPartition("nvme0n1p1", "data")
 		d.Emit(udev.Added{Device: dev})
