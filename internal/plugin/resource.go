@@ -2,11 +2,12 @@ package plugin
 
 import (
 	"context"
+	"errors"
+	"sort"
 	"sync"
 
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 
-	"github.com/ydb-platform/udev-manager/internal/mux"
 	"github.com/ydb-platform/udev-manager/internal/udev"
 )
 
@@ -51,20 +52,17 @@ type Instance interface {
 // match and should be ignored.
 type FromDevice[T any] func(dev udev.Device) (T, error)
 
-// HealthEvent carries a set of instances and their new health state to a
-// [Resource].
-type HealthEvent struct {
-	Instances []Instance
-	Health
-}
-
 // Resource is a Kubernetes device-plugin resource backed by a set of
-// [Instance] values. It implements [mux.Sink] to receive health updates.
+// [Instance] values. Apply atomically replaces its complete desired state;
+// Watch notifies ListAndWatch handlers that they should pull the latest frozen
+// kubelet-visible view from Devices.
 type Resource interface {
-	mux.Sink[HealthEvent]
 	Name() string
 	Instances() map[Id]Instance
-	ListAndWatch(context.Context) <-chan []Instance
+	Devices() []*pluginapi.Device
+	Apply(map[Id]Instance) error
+	Watch(context.Context) <-chan struct{}
+	Close()
 }
 
 // ResourceTemplate identifies a resource by its domain and name prefix,
@@ -94,18 +92,34 @@ type resource struct {
 	resourceTemplate ResourceTemplate
 	mu               sync.RWMutex
 	instances        map[Id]Instance
-	broadcast        *mux.Mux[[]Instance]
+	devices          []*pluginapi.Device
+	advertised       []advertisedDevice
+	watchers         map[chan struct{}]struct{}
+	closed           bool
 	done             chan struct{}
 	doneOnce         sync.Once
 }
 
-// newResource creates a resource. Submit updates are broadcast to all
-// ListAndWatch subscribers via an internal mux.
+type advertisedDevice struct {
+	id       string
+	health   string
+	numaNode []int64
+}
+
+var errResourceClosed = errors.New("resource is closed")
+
+// newResource creates a resource with a fully initialized first state. A
+// plugin can therefore begin ListAndWatch immediately after Registry.Add
+// without observing a partially projected reconciliation.
 func newResource(template ResourceTemplate, instances map[Id]Instance) *resource {
+	instanceCopy := cloneInstances(instances)
+	devices, advertised := freezeDevices(instanceCopy)
 	return &resource{
 		resourceTemplate: template,
-		instances:        instances,
-		broadcast:        mux.Make[[]Instance](),
+		instances:        instanceCopy,
+		devices:          devices,
+		advertised:       advertised,
+		watchers:         make(map[chan struct{}]struct{}),
 		done:             make(chan struct{}),
 	}
 }
@@ -115,7 +129,7 @@ func (r *resource) Name() string {
 }
 
 // Instances returns a snapshot copy of the current instance map.
-// Safe to call concurrently with Submit.
+// Safe to call concurrently with Apply.
 func (r *resource) Instances() map[Id]Instance {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -126,72 +140,189 @@ func (r *resource) Instances() map[Id]Instance {
 	return snapshot
 }
 
-// Submit updates instance health state and broadcasts a snapshot to all
-// active ListAndWatch subscribers.
-func (r *resource) Submit(ev HealthEvent) error {
+// Devices returns a deep copy of the current frozen kubelet-visible view.
+// Health and topology are materialized during Apply, so a ListAndWatch response
+// cannot mix fields from different reconciliation generations.
+func (r *resource) Devices() []*pluginapi.Device {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return cloneDevices(r.devices)
+}
+
+// Apply atomically replaces allocation backing and, when the serialized
+// kubelet view changed, wakes every ListAndWatch subscriber exactly once at
+// most. Allocation backing is replaced even for a visible no-op so metadata
+// changes at a reused syspath take effect.
+func (r *resource) Apply(instances map[Id]Instance) error {
+	nextInstances := cloneInstances(instances)
+	nextDevices, nextAdvertised := freezeDevices(nextInstances)
+
 	r.mu.Lock()
-	for _, instance := range ev.Instances {
-		r.instances[instance.Id()] = &healthOverride{
-			Instance: instance,
-			health:   ev.Health,
+	defer r.mu.Unlock()
+	if r.closed {
+		return errResourceClosed
+	}
+
+	r.instances = nextInstances
+	if advertisedDevicesEqual(r.advertised, nextAdvertised) {
+		return nil
+	}
+	r.devices = nextDevices
+	r.advertised = nextAdvertised
+	r.notifyLocked()
+	return nil
+}
+
+func cloneInstances(instances map[Id]Instance) map[Id]Instance {
+	result := make(map[Id]Instance, len(instances))
+	for id, instance := range instances {
+		result[id] = instance
+	}
+	return result
+}
+
+func freezeDevices(instances map[Id]Instance) ([]*pluginapi.Device, []advertisedDevice) {
+	ids := make([]string, 0, len(instances))
+	byID := make(map[string]Instance, len(instances))
+	for id, instance := range instances {
+		key := string(id)
+		ids = append(ids, key)
+		byID[key] = instance
+	}
+	sort.Strings(ids)
+
+	devices := make([]*pluginapi.Device, 0, len(ids))
+	advertised := make([]advertisedDevice, 0, len(ids))
+	for _, id := range ids {
+		instance := byID[id]
+		health := instance.Health().String()
+		nodes := topologyNodes(instance.TopologyHints())
+		devices = append(devices, &pluginapi.Device{
+			ID:       id,
+			Health:   health,
+			Topology: topologyFromNodes(nodes),
+		})
+		advertised = append(advertised, advertisedDevice{
+			id:       id,
+			health:   health,
+			numaNode: nodes,
+		})
+	}
+	return devices, advertised
+}
+
+func topologyNodes(topology *pluginapi.TopologyInfo) []int64 {
+	if topology == nil {
+		return nil
+	}
+	nodes := make([]int64, 0, len(topology.Nodes))
+	for _, node := range topology.Nodes {
+		if node != nil {
+			nodes = append(nodes, node.ID)
 		}
 	}
-	snapshot := r.snapshotLocked()
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i] < nodes[j] })
+	return nodes
+}
+
+func topologyFromNodes(nodes []int64) *pluginapi.TopologyInfo {
+	if len(nodes) == 0 {
+		return nil
+	}
+	topology := &pluginapi.TopologyInfo{Nodes: make([]*pluginapi.NUMANode, len(nodes))}
+	for i, id := range nodes {
+		topology.Nodes[i] = &pluginapi.NUMANode{ID: id}
+	}
+	return topology
+}
+
+func advertisedDevicesEqual(a, b []advertisedDevice) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].id != b[i].id || a[i].health != b[i].health || len(a[i].numaNode) != len(b[i].numaNode) {
+			return false
+		}
+		for j := range a[i].numaNode {
+			if a[i].numaNode[j] != b[i].numaNode[j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func cloneDevices(devices []*pluginapi.Device) []*pluginapi.Device {
+	result := make([]*pluginapi.Device, len(devices))
+	for i, device := range devices {
+		if device == nil {
+			continue
+		}
+		result[i] = &pluginapi.Device{
+			ID:       device.ID,
+			Health:   device.Health,
+			Topology: topologyFromNodes(topologyNodes(device.Topology)),
+		}
+	}
+	return result
+}
+
+// Watch registers a capacity-one dirty notification. The initial token and
+// registration linearize under the same lock as Apply. Consumers must receive
+// a token before calling Devices: an update either wins that read and is
+// included, or happens afterward and leaves a token for the next read.
+func (r *resource) Watch(ctx context.Context) <-chan struct{} {
+	updates := make(chan struct{}, 1)
+	r.mu.Lock()
+	if r.closed {
+		close(updates)
+		r.mu.Unlock()
+		return updates
+	}
+	r.watchers[updates] = struct{}{}
+	updates <- struct{}{}
 	r.mu.Unlock()
-
-	return r.broadcast.Submit(snapshot)
-}
-
-func (r *resource) snapshotLocked() []Instance {
-	all := make([]Instance, 0, len(r.instances))
-	for _, inst := range r.instances {
-		all = append(all, inst)
-	}
-	return all
-}
-
-// ListAndWatch returns a channel that receives instance snapshots. Each call
-// creates an independent subscriber that first receives the current state and
-// then all subsequent updates. The subscription is cancelled when ctx is done.
-// Safe to call multiple times (e.g. on kubelet reconnect).
-func (r *resource) ListAndWatch(ctx context.Context) <-chan []Instance {
-	ch := make(chan []Instance, 2)
-
-	select {
-	case <-r.done:
-		close(ch)
-		return ch
-	default:
-	}
-
-	sink := mux.SinkFromChan(ch)
-
-	// Hold RLock across subscribe + snapshot so that no Submit can
-	// interleave between the two operations. This guarantees the
-	// subscriber receives the replay snapshot before any future update.
-	r.mu.RLock()
-	cancel := r.broadcast.Subscribe(sink)
-	snapshot := r.snapshotLocked()
-	r.mu.RUnlock()
-
-	// Replay current state. Non-blocking because ch has capacity 2.
-	ch <- snapshot
 
 	go func() {
 		select {
 		case <-ctx.Done():
-			cancel()
+			r.removeWatcher(updates)
 		case <-r.done:
 		}
 	}()
+	return updates
+}
 
-	return ch
+func (r *resource) notifyLocked() {
+	for updates := range r.watchers {
+		select {
+		case updates <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (r *resource) removeWatcher(updates chan struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.watchers[updates]; !ok {
+		return
+	}
+	delete(r.watchers, updates)
+	close(updates)
 }
 
 // Close shuts down the resource and closes all subscriber channels.
 func (r *resource) Close() {
 	r.doneOnce.Do(func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.closed = true
 		close(r.done)
-		r.broadcast.Close()
+		for updates := range r.watchers {
+			delete(r.watchers, updates)
+			close(updates)
+		}
 	})
 }

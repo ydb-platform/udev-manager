@@ -83,6 +83,22 @@ func NetRdmaMatcherTemplater(domain string, matcher *regexp.Regexp) FromDevice[*
 // NetRdmaMatcherInstances returns a FromDevice function that produces
 // resourcesCount netRdma instances for each matching RDMA-capable net device.
 func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesCount int) FromDevice[[]*netRdma] {
+	return netRdmaMatcherInstances(
+		domain,
+		matcher,
+		resourcesCount,
+		rdmamap.GetRdmaDeviceForNetdevice,
+		rdmamap.GetRdmaCharDevices,
+	)
+}
+
+func netRdmaMatcherInstances(
+	domain string,
+	matcher *regexp.Regexp,
+	resourcesCount int,
+	lookupDevice func(string) (string, error),
+	lookupCharDevices func(string) []string,
+) FromDevice[[]*netRdma] {
 	return func(dev udev.Device) ([]*netRdma, error) {
 		if dev.Subsystem() != udev.NetSubsystem {
 			return nil, nil
@@ -97,12 +113,14 @@ func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesCou
 			return nil, nil
 		}
 
-		rdmaDevice, err := rdmamap.GetRdmaDeviceForNetdevice(ifname)
-		if err != nil {
-			klog.Errorf("fail to get rdma devices for network device: %s %v", ifname, err)
+		rdmaDevice, err := lookupDevice(ifname)
+		if isRdmaNonMatch(ifname, rdmaDevice, err) {
 			return nil, nil
 		}
-		rdmaCharDevices := rdmamap.GetRdmaCharDevices(rdmaDevice)
+		if err != nil {
+			return nil, fmt.Errorf("get RDMA device for network interface %q: %w", ifname, err)
+		}
+		rdmaCharDevices := lookupCharDevices(rdmaDevice)
 		klog.Infof("found rdma character devices for ifname: %s devices: %v", ifname, rdmaCharDevices)
 
 		instances := make([]*netRdma, 0, resourcesCount)
@@ -118,4 +136,18 @@ func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesCou
 
 		return instances, nil
 	}
+}
+
+func isRdmaNonMatch(ifname, rdmaDevice string, err error) bool {
+	if err == nil {
+		// The upstream lookup returns an empty device without an error when an
+		// IPoIB interface has no matching RDMA device.
+		return rdmaDevice == ""
+	}
+
+	// rdmamap does not export sentinel errors. These two exact errors describe
+	// definitive non-RDMA interfaces; LinkByName and sysfs read errors remain
+	// transient failures so Scatter preserves their last-good resource state.
+	return err.Error() == fmt.Sprintf("rdma device not found for netdev %s", ifname) ||
+		err.Error() == "unknown device type"
 }

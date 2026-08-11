@@ -83,15 +83,37 @@ func NetBWMatcherInstances(domain string, matcher *regexp.Regexp, mbpsPerShare u
 		if !matcher.MatchString(ifname) {
 			return nil, nil
 		}
+		if mbpsPerShare == 0 {
+			return nil, fmt.Errorf("bandwidth per share must be positive")
+		}
 
 		speedString := dev.SystemAttribute(udev.SysAttrSpeed)
+		linkUp := dev.SystemAttribute(udev.SysAttrOperstate) == "up"
 		if speedString == "" {
-			return nil, nil
+			// A down link commonly reports no speed. Projecting no current
+			// instances lets Scatter retain the known IDs as Unhealthy
+			// tombstones instead of preserving a stale Healthy snapshot.
+			if !linkUp {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("network interface %q has no %q attribute", ifname, udev.SysAttrSpeed)
 		}
 
 		speedMbps, err := strconv.Atoi(speedString)
 		if err != nil {
-			return nil, nil
+			if !linkUp {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("parse %q speed %q: %w", ifname, speedString, err)
+		}
+		if speedMbps <= 0 {
+			// Linux conventionally exposes -1 while carrier is unavailable.
+			// Treat that together with the non-up operstate as an unhealthy
+			// device observation, not a transient projection failure.
+			if !linkUp {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("network interface %q has invalid speed %d Mbps", ifname, speedMbps)
 		}
 
 		shares := speedMbps / int(mbpsPerShare)

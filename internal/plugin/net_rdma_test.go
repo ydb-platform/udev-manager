@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"regexp"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -45,6 +46,101 @@ var _ = Describe("NetRdmaMatcherTemplater", func() {
 		Expect(tmpl).NotTo(BeNil())
 		Expect(tmpl.Domain).To(Equal("ydb.tech"))
 		Expect(tmpl.Prefix).To(Equal("netrdma-0"))
+	})
+})
+
+var _ = Describe("NetRdmaMatcherInstances", func() {
+	It("returns an error when the RDMA device lookup fails", func() {
+		const ifname = "rdma-interface-that-cannot-exist"
+		matcher := regexp.MustCompile(`.*`)
+		dev := netDevice(ifname, "100000", "up")
+
+		instances, err := NetRdmaMatcherInstances("ydb.tech", matcher, 1)(dev)
+
+		Expect(err).To(MatchError(ContainSubstring(`get RDMA device for network interface "` + ifname + `"`)))
+		Expect(instances).To(BeNil())
+	})
+
+	It("does not let a broad matcher's non-RDMA interface block a valid template", func() {
+		matcher := regexp.MustCompile(`.*`)
+		validTemplate := ResourceTemplate{Domain: "ydb.tech", Prefix: "netrdma-"}
+		validResource := newResource(validTemplate, map[Id]Instance{})
+		DeferCleanup(validResource.Close)
+		updates := validResource.Watch(context.Background())
+		Eventually(updates).Should(Receive())
+
+		lookupDevice := func(ifname string) (string, error) {
+			if ifname == "eth0" {
+				return "", errors.New("rdma device not found for netdev eth0")
+			}
+			return "mlx5_0", nil
+		}
+		lookupCharDevices := func(string) []string { return []string{"/dev/infiniband/uverbs0"} }
+		scatter := &Scatter[*netRdma]{
+			templater: NetRdmaMatcherTemplater("ydb.tech", matcher),
+			mapper: netRdmaMatcherInstances(
+				"ydb.tech",
+				matcher,
+				1,
+				lookupDevice,
+				lookupCharDevices,
+			),
+			routes: map[ResourceTemplate]Resource{validTemplate: validResource},
+			known:  make(map[ResourceTemplate]map[Id]Instance),
+		}
+
+		nonRDMA := netDevice("eth0", "1000", "up")
+		valid := netDevice("rdma0", "100000", "up")
+		scatter.applySnapshot(udev.Snapshot{
+			Generation: 1,
+			Devices:    []udev.Device{nonRDMA, valid},
+		})
+
+		Eventually(updates).Should(Receive())
+		Expect(validResource.Devices()).To(ConsistOf(And(
+			HaveField("ID", "rdma0_0"),
+			HaveField("Health", "Healthy"),
+		)))
+	})
+
+	DescribeTable("treats definitive non-RDMA lookup results as a non-match",
+		func(rdmaDevice string, lookupErr error) {
+			charDevicesCalled := false
+			mapper := netRdmaMatcherInstances(
+				"ydb.tech",
+				regexp.MustCompile(`.*`),
+				1,
+				func(string) (string, error) { return rdmaDevice, lookupErr },
+				func(string) []string {
+					charDevicesCalled = true
+					return nil
+				},
+			)
+
+			instances, err := mapper(netDevice("eth0", "1000", "up"))
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(instances).To(BeNil())
+			Expect(charDevicesCalled).To(BeFalse())
+		},
+		Entry("when Ethernet has no RDMA mapping", "", errors.New("rdma device not found for netdev eth0")),
+		Entry("when IPoIB lookup returns an empty device", "", nil),
+		Entry("when the link type cannot support RDMA", "", errors.New("unknown device type")),
+	)
+
+	It("preserves transient RDMA lookup errors", func() {
+		mapper := netRdmaMatcherInstances(
+			"ydb.tech",
+			regexp.MustCompile(`.*`),
+			1,
+			func(string) (string, error) { return "", errors.New("temporary sysfs read failure") },
+			func(string) []string { return nil },
+		)
+
+		instances, err := mapper(netDevice("eth0", "1000", "up"))
+
+		Expect(err).To(MatchError(ContainSubstring("temporary sysfs read failure")))
+		Expect(instances).To(BeNil())
 	})
 })
 

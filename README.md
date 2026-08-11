@@ -41,6 +41,7 @@ The binary accepts a `--config` flag with one of:
 | `domain` | string | **Required.** Resource domain (e.g. `ydb.tech`). |
 | `disable_topology_hints` | bool | Disable NUMA topology hints for partition devices. |
 | `health_check_port` | uint16 | Port for `/healthz` endpoint (default: `8080`). |
+| `reconcile_interval` | duration | How often to re-enumerate devices and repair missed udev events, using a value such as `30s` or `2m` (default: `1m`). |
 | `partitions` | list | Expose each matching partition as its own resource. |
 | `batchPartitions` | list | Group matching partitions into a single resource. |
 | `networkBandwidth` | list | Expose network bandwidth shares as resources. |

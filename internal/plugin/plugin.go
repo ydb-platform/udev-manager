@@ -22,6 +22,7 @@ import (
 type plugin struct {
 	resource  Resource
 	pluginDir string
+	ctx       context.Context
 	cancel    context.CancelFunc
 	stopped   chan struct{} // closed after gRPC server is fully stopped
 }
@@ -31,6 +32,7 @@ func newPlugin(resource Resource, ctx context.Context, wg *sync.WaitGroup, plugi
 	plugin := &plugin{
 		resource:  resource,
 		pluginDir: pluginDir,
+		ctx:       ctx,
 		cancel:    cancel,
 		stopped:   make(chan struct{}),
 	}
@@ -99,21 +101,17 @@ func (p *plugin) ListAndWatch(empty *pluginapi.Empty, stream pluginapi.DevicePlu
 	defer klog.Infof("%q: closing ListAndWatch connection, err = %v", p.resource.Name(), err)
 
 	ctx := stream.Context()
-	instanceCh := p.resource.ListAndWatch(ctx)
+	updates := p.resource.Watch(ctx)
 	for {
 		select {
-		case instances, ok := <-instanceCh:
+		case _, ok := <-updates:
 			if !ok {
 				return nil
 			}
-			devices := make([]*pluginapi.Device, len(instances))
-			for i, instance := range instances {
-				devices[i] = &pluginapi.Device{
-					ID:       string(instance.Id()),
-					Health:   instance.Health().String(),
-					Topology: instance.TopologyHints(),
-				}
-			}
+			// Clear the dirty token before reading Devices. If Apply happens
+			// before the read, this response includes it; if Apply happens after
+			// the read, the now-empty mailbox retains a token for the next one.
+			devices := p.resource.Devices()
 			klog.V(2).Infof("%q: sending devices to ListAndWatch stream: %+v", p.resource.Name(), devices)
 			if err := stream.Send(&pluginapi.ListAndWatchResponse{Devices: devices}); err != nil {
 				klog.Errorf("%q: failed to send devices to ListAndWatch stream: %v", p.resource.Name(), err)

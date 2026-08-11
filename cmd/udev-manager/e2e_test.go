@@ -784,6 +784,42 @@ partitions:
 		})
 	})
 
+	Describe("Kubelet registration retry", func() {
+		It("eventually registers when the kubelet is initially unavailable", func() {
+			dev := makePartitionDevice("/sys/block/nvme0n1/nvme0n1p1", "/dev/nvme0n1p1", "nvme_disk01")
+			discovery.AddDevice(dev)
+
+			config := mustParseYAML(`
+domain: ydb.tech
+partitions:
+  - matcher: "nvme_(.*)"
+`)
+
+			By("making the first registration attempts fail")
+			kubelet.FailRegistrations(3)
+
+			startTestApp(ctx, wg, discovery, config, tmpDir, kubeSock)
+
+			By("registration eventually succeeds after retries with backoff")
+			waitForRegistrations(kubelet, 1)
+			reg := kubelet.Registrations()[0]
+			Expect(reg.ResourceName).To(Equal("ydb.tech/part-disk01"))
+
+			By("the plugin serves ListAndWatch normally after the delayed registration")
+			sockets := waitForSockets(tmpDir)
+			client, conn := dialPlugin(sockets[0])
+			DeferCleanup(func() { conn.Close() })
+
+			stream, err := client.ListAndWatch(ctx, &pluginapi.Empty{})
+			Expect(err).NotTo(HaveOccurred())
+
+			resp := recvWithTimeout(stream, 5*time.Second)
+			Expect(resp.Devices).To(HaveLen(1))
+			Expect(resp.Devices[0].ID).To(Equal("disk01"))
+			Expect(resp.Devices[0].Health).To(Equal("Healthy"))
+		})
+	})
+
 	Describe("Shutdown", func() {
 		It("terminates ListAndWatch stream when context is cancelled", func() {
 			dev := makePartitionDevice("/sys/block/nvme0n1/nvme0n1p1", "/dev/nvme0n1p1", "nvme_disk01")

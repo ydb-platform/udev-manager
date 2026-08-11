@@ -2,6 +2,7 @@ package main
 
 import (
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -58,6 +59,43 @@ domain: ydb.tech
 health_check_port: 9090
 `)
 		Expect(cfg.HealthCheckPort).To(BeEquivalentTo(9090))
+	})
+
+	It("defaults reconcile_interval to one minute", func() {
+		cfg := mustParseYAML(minimalValidConfig)
+		Expect(time.Duration(*cfg.ReconcileInterval)).To(Equal(time.Minute))
+	})
+
+	It("parses an explicit reconcile_interval", func() {
+		cfg := mustParseYAML(`
+domain: ydb.tech
+reconcile_interval: 15s
+`)
+		Expect(time.Duration(*cfg.ReconcileInterval)).To(Equal(15 * time.Second))
+	})
+
+	It("rejects a negative reconcile_interval", func() {
+		_, err := parseYAML(`
+domain: ydb.tech
+reconcile_interval: -1s
+`)
+		Expect(err).To(MatchError(ContainSubstring(".reconcile_interval")))
+	})
+
+	It("rejects a zero reconcile_interval", func() {
+		_, err := parseYAML(`
+domain: ydb.tech
+reconcile_interval: 0s
+`)
+		Expect(err).To(MatchError(ContainSubstring(".reconcile_interval")))
+	})
+
+	It("rejects a numeric reconcile_interval", func() {
+		_, err := parseYAML(`
+domain: ydb.tech
+reconcile_interval: 15
+`)
+		Expect(err).To(MatchError(ContainSubstring("duration string")))
 	})
 
 	It("accepts disable_topology_hints flag", func() {
@@ -198,8 +236,13 @@ var _ = Describe("netBWConfig.validate", func() {
 		Expect(nc.validate()).To(MatchError(ContainSubstring(".matcher")))
 	})
 
+	It("rejects zero Mbps per share", func() {
+		nc := &netBWConfig{Matcher: `eth.*`}
+		Expect(nc.validate()).To(MatchError(ContainSubstring(".mbpsPerShare")))
+	})
+
 	It("compiles matcher so it can be used after validate", func() {
-		nc := &netBWConfig{Matcher: `eth\d+`}
+		nc := &netBWConfig{Matcher: `eth\d+`, MbpsPerShare: 100}
 		Expect(nc.validate()).NotTo(HaveOccurred())
 		Expect(nc.matcher.MatchString("eth0")).To(BeTrue())
 		Expect(nc.matcher.MatchString("wlan0")).To(BeFalse())
@@ -318,6 +361,31 @@ networkBandwidth:
 		Expect(cfg.NetworkBandwidth).To(HaveLen(1))
 		Expect(cfg.NetworkBandwidth[0].MbpsPerShare).To(BeEquivalentTo(100))
 		Expect(cfg.NetworkBandwidth[0].matcher).NotTo(BeNil())
+	})
+
+	It("rejects networkBandwidth with omitted mbpsPerShare", func() {
+		_, err := parseYAML(`
+domain: ydb.tech
+networkBandwidth:
+  - matcher: "eth(.*)"
+`)
+		Expect(err).To(MatchError(And(
+			ContainSubstring(".networkBandwidth[0]"),
+			ContainSubstring(".mbpsPerShare"),
+		)))
+	})
+
+	It("rejects networkBandwidth with explicit zero mbpsPerShare", func() {
+		_, err := parseYAML(`
+domain: ydb.tech
+networkBandwidth:
+  - matcher: "eth(.*)"
+    mbpsPerShare: 0
+`)
+		Expect(err).To(MatchError(And(
+			ContainSubstring(".networkBandwidth[0]"),
+			ContainSubstring(".mbpsPerShare"),
+		)))
 	})
 
 	It("parses networkRdma section", func() {
