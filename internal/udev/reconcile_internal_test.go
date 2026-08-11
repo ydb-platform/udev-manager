@@ -83,12 +83,121 @@ func newControllerTestDiscovery(requestBuffer int) *udevDiscovery {
 		ctx:               ctx,
 		cancel:            cancel,
 		state:             make(map[Id]Device),
+		offline:           make(map[Id]uint64),
 		requests:          make(chan mux.AwaitReply[monitorRequest, any], requestBuffer),
 		mux:               mux.Make[Snapshot](),
 		done:              make(chan struct{}),
 		monitorReady:      monitorReady,
 		reconcileC:        make(chan struct{}, 1),
 		reconcileInterval: time.Hour,
+	}
+}
+
+func TestOfflineDeviceRemainsExcludedWhileEnumerable(t *testing.T) {
+	discovery := &udevDiscovery{
+		state:   make(map[Id]Device),
+		offline: make(map[Id]uint64),
+	}
+	dev := NewFakeDevice("device")
+	found := map[Id]Device{dev.Id(): dev}
+
+	discovery.recordDeviceAction(ActionOffline, dev.Id())
+	for generation := uint64(1); generation <= 2; generation++ {
+		scanStart := discovery.beginEnumeration()
+		snapshot, _, _ := discovery.commitEnumeration(found, scanStart)
+		if snapshot.Generation != generation {
+			t.Fatalf("generation = %d, want %d", snapshot.Generation, generation)
+		}
+		if len(snapshot.Devices) != 0 {
+			t.Fatalf("offline device was published on generation %d: %+v", generation, snapshot.Devices)
+		}
+		if got := discovery.DeviceById(dev.Id()); got != nil {
+			t.Fatalf("offline device remained in discovery state: %v", got)
+		}
+	}
+
+	discovery.recordDeviceAction(ActionOnline, dev.Id())
+	snapshot, added, removed := discovery.commitEnumeration(found, discovery.beginEnumeration())
+	if added != 1 || removed != 0 {
+		t.Fatalf("online enumeration delta = (%d added, %d removed), want (1, 0)", added, removed)
+	}
+	if len(snapshot.Devices) != 1 || snapshot.Devices[0] != dev {
+		t.Fatalf("online device snapshot = %+v, want %v", snapshot.Devices, dev)
+	}
+}
+
+func TestOfflineMarkIsClearedByRemove(t *testing.T) {
+	discovery := &udevDiscovery{
+		state:   make(map[Id]Device),
+		offline: make(map[Id]uint64),
+	}
+	dev := NewFakeDevice("device")
+	found := map[Id]Device{dev.Id(): dev}
+
+	discovery.recordDeviceAction(ActionOffline, dev.Id())
+	discovery.recordDeviceAction(ActionRemove, dev.Id())
+	snapshot, _, _ := discovery.commitEnumeration(found, discovery.beginEnumeration())
+	if len(snapshot.Devices) != 1 || snapshot.Devices[0] != dev {
+		t.Fatalf("authoritatively enumerable device after remove = %+v, want %v", snapshot.Devices, dev)
+	}
+}
+
+func TestOfflineMarkIsClearedByAddAtSameSyspath(t *testing.T) {
+	discovery := &udevDiscovery{
+		state:   make(map[Id]Device),
+		offline: make(map[Id]uint64),
+	}
+	old := NewFakeDevice("device")
+	replacement := NewFakeDevice("device").WithProperty("generation", "replacement")
+
+	discovery.recordDeviceAction(ActionOffline, old.Id())
+	discovery.recordDeviceAction(ActionAdd, replacement.Id())
+	snapshot, _, _ := discovery.commitEnumeration(
+		map[Id]Device{replacement.Id(): replacement},
+		discovery.beginEnumeration(),
+	)
+	if len(snapshot.Devices) != 1 || snapshot.Devices[0] != replacement {
+		t.Fatalf("replacement at an offline syspath = %+v, want %v", snapshot.Devices, replacement)
+	}
+}
+
+func TestEnumerationAbsenceDoesNotClearAnOfflineActionRacingWithScan(t *testing.T) {
+	discovery := &udevDiscovery{
+		state:   make(map[Id]Device),
+		offline: make(map[Id]uint64),
+	}
+	dev := NewFakeDevice("device")
+
+	// Model an enumeration that started before the offline action and therefore
+	// did not observe the device. Its commit must not erase the action before
+	// the event-triggered trailing enumeration sees the still-enumerable ID.
+	scanStart := discovery.beginEnumeration()
+	discovery.recordDeviceAction(ActionOffline, dev.Id())
+	discovery.commitEnumeration(map[Id]Device{}, scanStart)
+	snapshot, _, _ := discovery.commitEnumeration(
+		map[Id]Device{dev.Id(): dev},
+		discovery.beginEnumeration(),
+	)
+	if len(snapshot.Devices) != 0 {
+		t.Fatalf("offline device from trailing enumeration was published: %+v", snapshot.Devices)
+	}
+}
+
+func TestLaterEnumerationClearsStaleOfflineMarkForAbsentDevice(t *testing.T) {
+	discovery := &udevDiscovery{
+		state:   make(map[Id]Device),
+		offline: make(map[Id]uint64),
+	}
+	dev := NewFakeDevice("device")
+
+	discovery.recordDeviceAction(ActionOffline, dev.Id())
+	discovery.commitEnumeration(map[Id]Device{}, discovery.beginEnumeration())
+	snapshot, _, _ := discovery.commitEnumeration(
+		map[Id]Device{dev.Id(): dev},
+		discovery.beginEnumeration(),
+	)
+	if len(snapshot.Devices) != 1 || snapshot.Devices[0] != dev {
+		t.Fatalf("device after stale offline mark cleanup = %+v, want %v", snapshot.Devices, dev)
 	}
 }
 

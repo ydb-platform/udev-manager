@@ -60,7 +60,8 @@ type Snapshot struct {
 }
 
 // Slice is a filtered, live view of the device set. Subscribers receive a
-// fresh []Device snapshot every time the matching set changes.
+// fresh []Device snapshot whenever matching membership or a matching Device
+// observation changes.
 type Slice interface {
 	mux.Source[[]Device]
 }

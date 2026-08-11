@@ -156,6 +156,7 @@ type FakeDiscovery struct {
 	state      map[Id]Device
 	generation uint64
 	m          *mux.Mux[Snapshot]
+	closed     bool
 }
 
 // NewFakeDiscovery creates a FakeDiscovery with an empty device state.
@@ -172,6 +173,9 @@ func NewFakeDiscovery() *FakeDiscovery {
 func (f *FakeDiscovery) AddDevice(dev Device) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closed {
+		return
+	}
 	f.state[dev.Id()] = dev
 }
 
@@ -182,6 +186,9 @@ func (f *FakeDiscovery) AddDevice(dev Device) {
 func (f *FakeDiscovery) Emit(ev Event) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closed {
+		return
+	}
 	switch e := ev.(type) {
 	case Added:
 		f.state[e.Id()] = e.Device
@@ -199,13 +206,21 @@ func (f *FakeDiscovery) Emit(ev Event) {
 // to subsequent generations. The returned [mux.CancelFunc] unsubscribes sink.
 //
 // The initial delivery and mux subscription are performed atomically under a
-// write lock to prevent races with [Emit]. The sink must not block in Submit
-// (e.g., use a buffered channel) to avoid holding the lock.
+// write lock to prevent races with [Emit] or [FakeDiscovery.Close]. A
+// latest-only wrapper keeps delivery to the caller from holding that lock.
 func (f *FakeDiscovery) Subscribe(sink mux.Sink[Snapshot]) mux.CancelFunc {
 	latest := mux.LatestSink(sink)
 	// Hold the write lock across both the initial delivery and the mux
-	// subscription so that no Emit can interleave between the two steps.
+	// subscription so that no Emit or Close can interleave between the two
+	// steps. Mux.Subscribe deliberately leaves a sink untouched when called
+	// after Mux.Close, so handle that lifecycle state here and close the newly
+	// created latest-sink worker ourselves.
 	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		latest.Close()
+		return func() {}
+	}
 	_ = latest.Submit(Snapshot{
 		Generation: f.generation,
 		Devices:    deviceSnapshot(f.state),
@@ -242,5 +257,11 @@ func (f *FakeDiscovery) Slice(filter mux.FilterFunc[Device]) Slice {
 
 // Close shuts down the FakeDiscovery and closes all subscriber sinks.
 func (f *FakeDiscovery) Close() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return
+	}
+	f.closed = true
 	f.m.Close()
 }

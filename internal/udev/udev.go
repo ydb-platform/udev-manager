@@ -3,6 +3,7 @@ package udev
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -230,6 +231,8 @@ type udevDiscovery struct {
 	cancel            context.CancelFunc
 	mu                sync.RWMutex
 	state             map[Id]Device
+	offline           map[Id]uint64
+	actionSequence    uint64
 	requests          chan mux.AwaitReply[monitorRequest, any]
 	mux               *mux.Mux[Snapshot]
 	wg                *sync.WaitGroup
@@ -263,10 +266,12 @@ func WithReconcileInterval(interval time.Duration) DiscoveryOption {
 }
 
 // NewDiscovery creates a real udev-backed Discovery. Netlink notifications
-// only trigger reconciliation; they never mutate discovery state directly.
-// A successful enumeration replaces the authoritative state and publishes one
-// full Snapshot. The socket is opened before the initial enumeration so an
-// event arriving during a scan schedules a trailing pass.
+// never mutate device membership directly; they trigger reconciliation, while
+// offline/online lifecycle actions maintain an exclusion overlay for devices
+// that remain enumerable while unavailable. A successful enumeration replaces
+// the authoritative state and publishes one full Snapshot. The socket is
+// opened before the initial enumeration so an event arriving during a scan
+// schedules a trailing pass.
 //
 // Periodic reconciliation remains as a repair path for netlink overflow and
 // monitor outages.
@@ -274,6 +279,7 @@ func NewDiscovery(wg *sync.WaitGroup, opts ...DiscoveryOption) (Discovery, error
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &udevDiscovery{
 		state:             make(map[Id]Device),
+		offline:           make(map[Id]uint64),
 		requests:          make(chan mux.AwaitReply[monitorRequest, any]),
 		ctx:               ctx,
 		cancel:            cancel,
@@ -332,8 +338,8 @@ func (d *udevDiscovery) Slice(filter mux.FilterFunc[Device]) Slice {
 }
 
 // makeSlice creates a Slice backed by authoritative discovery snapshots. It
-// replaces its filtered state on every generation and publishes only when the
-// matching device set changes.
+// replaces its filtered state on every generation and publishes when matching
+// membership or any matching Device observation changes.
 //
 // Slice.Subscribe replays the current state to every new subscriber so callers
 // always receive a consistent snapshot before any subsequent updates.
@@ -365,10 +371,10 @@ func makeSlice(src mux.Source[Snapshot], filter mux.FilterFunc[Device]) Slice {
 						next[dev.Id()] = dev
 					}
 				}
-				membershipChanged := !initialized || !sameDeviceState(slice.state, next)
+				stateChanged := !initialized || !sameDeviceState(slice.state, next)
 				initialized = true
 				slice.state = next
-				if !membershipChanged {
+				if !stateChanged {
 					continue
 				}
 				if err := slice.mux.Submit(sliceSnapshot(slice.state)); err != nil {
@@ -406,20 +412,37 @@ func makeSlice(src mux.Source[Snapshot], filter mux.FilterFunc[Device]) Slice {
 	return slice
 }
 
-// sameDeviceState compares filtered set membership. Discovery replaces Device
-// objects on every enumeration, so pointer equality would turn every periodic
-// pass into a spurious Slice update. Plugin projection consumes Discovery
-// snapshots directly and therefore still refreshes metadata at retained IDs.
+// sameDeviceState compares both membership and device identity. Device values
+// are immutable observations: replacing the value at a retained syspath can
+// carry changed properties or sysattrs and must therefore reach existing Slice
+// subscribers. Production enumeration creates fresh generic values, so a Slice
+// intentionally refreshes on each successful pass; LatestSink bounds slow
+// subscribers to the newest complete view.
 func sameDeviceState(a, b map[Id]Device) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for id := range a {
-		if _, ok := b[id]; !ok {
+	for id, current := range a {
+		next, ok := b[id]
+		if !ok || !sameDeviceIdentity(current, next) {
 			return false
 		}
 	}
 	return true
+}
+
+// sameDeviceIdentity avoids comparing interface values whose concrete type is
+// not comparable. Such values cannot express stable identity, so conservatively
+// treat them as replacements and publish the new observation.
+func sameDeviceIdentity(a, b Device) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	typ := reflect.TypeOf(a)
+	if typ != reflect.TypeOf(b) || !typ.Comparable() {
+		return false
+	}
+	return a == b
 }
 
 // sliceSnapshot returns a stable copy of the device map as a slice.
@@ -517,12 +540,73 @@ func deviceSnapshot(state map[Id]Device) []Device {
 	return devices
 }
 
+// recordDeviceAction maintains the exceptional availability overlay carried
+// by udev's offline/online actions. Ordinary add/remove membership still comes
+// exclusively from enumeration: add/remove only clear a now-obsolete offline
+// mark, they do not insert or delete discovery state directly.
+func (d *udevDiscovery) recordDeviceAction(action string, id Id) {
+	d.mu.Lock()
+	switch action {
+	case ActionOffline:
+		d.actionSequence++
+		if d.offline == nil {
+			d.offline = make(map[Id]uint64)
+		}
+		d.offline[id] = d.actionSequence
+	case ActionAdd, ActionOnline, ActionRemove:
+		d.actionSequence++
+		delete(d.offline, id)
+	}
+	d.mu.Unlock()
+}
+
+func (d *udevDiscovery) beginEnumeration() uint64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.actionSequence
+}
+
+// commitEnumeration atomically replaces discovery state with one complete
+// enumeration, excluding devices explicitly marked offline. An offline mark
+// survives while its ID remains enumerable. An absent ID clears a mark only
+// when the mark existed at scanStart: a newer offline event raced with this
+// scan and must survive into the event-triggered trailing pass. This ordering
+// also lets later authoritative scans garbage-collect marks left behind by a
+// missed remove event. Explicit add/online/remove actions clear marks eagerly.
+func (d *udevDiscovery) commitEnumeration(found map[Id]Device, scanStart uint64) (Snapshot, int, int) {
+	d.mu.Lock()
+	for id, actionSequence := range d.offline {
+		if _, present := found[id]; !present && actionSequence <= scanStart {
+			delete(d.offline, id)
+		}
+	}
+
+	available := make(map[Id]Device, len(found))
+	for id, dev := range found {
+		if _, isOffline := d.offline[id]; !isOffline {
+			available[id] = dev
+		}
+	}
+
+	added, removed := enumerationDelta(d.state, available)
+	d.state = available
+	d.generation++
+	snapshot := Snapshot{
+		Generation: d.generation,
+		Devices:    deviceSnapshot(d.state),
+	}
+	d.mu.Unlock()
+
+	return snapshot, added, removed
+}
+
 // reconcile performs the only discovery-state transition in production. A
 // successful enumeration atomically replaces state and publishes one complete
 // snapshot. Publishing every successful pass (not only key changes) refreshes
 // same-syspath metadata and lets downstream consumers retry failed projection
 // without relying on another edge event.
 func (d *udevDiscovery) reconcile() bool {
+	scanStart := d.beginEnumeration()
 	enum := d.udev.NewEnumerate()
 	devs, err := enum.Devices()
 	if err != nil {
@@ -544,15 +628,7 @@ func (d *udevDiscovery) reconcile() bool {
 		}
 	}
 
-	d.mu.Lock()
-	added, removed := enumerationDelta(d.state, found)
-	d.state = found
-	d.generation++
-	snapshot := Snapshot{
-		Generation: d.generation,
-		Devices:    deviceSnapshot(d.state),
-	}
-	d.mu.Unlock()
+	snapshot, added, removed := d.commitEnumeration(found, scanStart)
 
 	if added > 0 || removed > 0 {
 		klog.V(4).Infof("reconcile: generation %d changed device keys: %d additions, %d removals", snapshot.Generation, added, removed)
@@ -596,10 +672,10 @@ func (d *udevDiscovery) signalReconcile() {
 }
 
 // monitorEvents owns the netlink monitor and continuously drains it while
-// enumeration runs in monitor. Event payloads are deliberately not applied to
-// state; every notification only marks reconciliation dirty. A capacity-one
-// signal coalesces bursts, and an event received during a scan leaves a token
-// for a trailing pass.
+// enumeration runs in monitor. Event payloads are never applied to membership;
+// offline/online lifecycle actions only update the availability overlay before
+// marking reconciliation dirty. A capacity-one signal coalesces bursts, and
+// an event received during a scan leaves a token for a trailing pass.
 func (d *udevDiscovery) monitorEvents(wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer close(d.eventsDone)
@@ -636,6 +712,7 @@ func (d *udevDiscovery) monitorEvents(wg *sync.WaitGroup) {
 					klog.Warning("udev: monitor returned a nil device; scheduling reconciliation")
 				} else {
 					klog.V(5).Infof("Received device notification (%s): %s", dev.Action(), dev.Syspath())
+					d.recordDeviceAction(dev.Action(), Id(dev.Syspath()))
 				}
 				d.signalReconcile()
 			case err, ok := <-errChan:

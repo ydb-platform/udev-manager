@@ -355,6 +355,47 @@ var _ = Describe("FakeDiscovery Subscribe", func() {
 		Eventually(ch1).Should(Receive(HaveField("Devices", ConsistOf(dev))))
 		Eventually(ch2).Should(Receive(HaveField("Devices", ConsistOf(dev))))
 	})
+
+	It("closes a subscriber created after discovery is closed", func() {
+		d.Close()
+		ch := make(chan udev.Snapshot)
+		cancel := d.Subscribe(mux.SinkFromChan(ch))
+		defer cancel()
+
+		Eventually(ch).Should(BeClosed())
+	})
+
+	It("closes every downstream sink when Subscribe races with Close", func() {
+		const attempts = 100
+		for range attempts {
+			raced := udev.NewFakeDiscovery()
+			ch := make(chan udev.Snapshot, 1)
+			cancelResult := make(chan mux.CancelFunc, 1)
+			start := make(chan struct{})
+
+			go func() {
+				<-start
+				cancelResult <- raced.Subscribe(mux.SinkFromChan(ch))
+			}()
+			go func() {
+				<-start
+				raced.Close()
+			}()
+			close(start)
+
+			var cancel mux.CancelFunc
+			Eventually(cancelResult).Should(Receive(&cancel))
+			cancel()
+			Eventually(func() bool {
+				select {
+				case _, ok := <-ch:
+					return !ok
+				default:
+					return false
+				}
+			}).Should(BeTrue())
+		}
+	})
 })
 
 // ---------------------------------------------------------------------------
@@ -514,6 +555,24 @@ var _ = Describe("Slice", func() {
 		d.Emit(udev.Added{Device: dev})
 
 		Eventually(ch).Should(Receive(ConsistOf(dev)))
+	})
+
+	It("emits a same-ID device replacement carrying changed metadata", func() {
+		original := blockPartition("nvme0n1p1", "old-label")
+		d.AddDevice(original)
+
+		s := d.Slice(isBlock)
+		ch, cancel := subscribeSlice(s)
+		defer cancel()
+		Eventually(ch).Should(Receive(ConsistOf(original)))
+
+		replacement := blockPartition("nvme0n1p1", "new-label")
+		d.Emit(udev.Added{Device: replacement})
+
+		var snapshot []udev.Device
+		Eventually(ch).Should(Receive(&snapshot))
+		Expect(snapshot).To(ConsistOf(replacement))
+		Expect(snapshot[0].Property(udev.PropertyPartName)).To(Equal("new-label"))
 	})
 
 	It("does not emit when an Added device does not match the filter", func() {
