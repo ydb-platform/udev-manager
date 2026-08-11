@@ -158,6 +158,158 @@ var _ = Describe("Scatter snapshot projection", func() {
 		Consistently(updates, 50*time.Millisecond).ShouldNot(Receive())
 	})
 
+	It("isolates a mapper failure to its resource template", func() {
+		const (
+			templateProperty = "TEST_TEMPLATE"
+			instanceProperty = "TEST_INSTANCE"
+			failProperty     = "TEST_FAIL"
+		)
+		templateA := ResourceTemplate{Domain: "ydb.tech", Prefix: "part-a"}
+		templateB := ResourceTemplate{Domain: "ydb.tech", Prefix: "part-b"}
+		resourceA := newResource(templateA, map[Id]Instance{})
+		resourceB := newResource(templateB, map[Id]Instance{})
+		DeferCleanup(resourceA.Close)
+		DeferCleanup(resourceB.Close)
+		updatesA := resourceA.Watch(context.Background())
+		updatesB := resourceB.Watch(context.Background())
+		Eventually(updatesA).Should(Receive())
+		Eventually(updatesB).Should(Receive())
+
+		device := func(syspath, route, instance string, fail bool) *mockDevice {
+			dev := partitionDevice(syspath, "unused")
+			dev.properties[templateProperty] = route
+			dev.properties[instanceProperty] = instance
+			if fail {
+				dev.properties[failProperty] = "true"
+			}
+			return dev
+		}
+		templater := func(dev udev.Device) (*ResourceTemplate, error) {
+			return &ResourceTemplate{
+				Domain: "ydb.tech",
+				Prefix: "part-" + dev.Property(templateProperty),
+			}, nil
+		}
+		mapper := func(dev udev.Device) ([]*partition, error) {
+			if dev.Property(failProperty) != "" {
+				return nil, errors.New("temporary mapping failure")
+			}
+			return []*partition{{
+				domain: "ydb.tech",
+				label:  dev.Property(instanceProperty),
+				dev:    dev,
+			}}, nil
+		}
+		isolated := &Scatter[*partition]{
+			templater: templater,
+			mapper:    mapper,
+			routes: map[ResourceTemplate]Resource{
+				templateA: resourceA,
+				templateB: resourceB,
+			},
+			known: make(map[ResourceTemplate]map[Id]Instance),
+		}
+
+		oldA := device("device-a", "a", "a-old", false)
+		oldB1 := device("device-b1", "b", "b-one", false)
+		oldB2 := device("device-b2", "b", "b-two", false)
+		isolated.applySnapshot(udev.Snapshot{
+			Generation: 1,
+			Devices:    []udev.Device{oldA, oldB1, oldB2},
+		})
+		Eventually(updatesA).Should(Receive())
+		Eventually(updatesB).Should(Receive())
+
+		newA := device("device-a", "a", "a-new", false)
+		failedB1 := device("device-b1", "b", "b-one", true)
+		newB2 := device("device-b2", "b", "b-new", false)
+		isolated.applySnapshot(udev.Snapshot{
+			Generation: 2,
+			Devices:    []udev.Device{newA, failedB1, newB2},
+		})
+
+		Eventually(updatesA).Should(Receive())
+		Expect(resourceA.Devices()).To(ConsistOf(
+			And(HaveField("ID", "a-old"), HaveField("Health", "Unhealthy")),
+			And(HaveField("ID", "a-new"), HaveField("Health", "Healthy")),
+		))
+		Expect(resourceB.Devices()).To(ConsistOf(
+			And(HaveField("ID", "b-one"), HaveField("Health", "Healthy")),
+			And(HaveField("ID", "b-two"), HaveField("Health", "Healthy")),
+		))
+		Expect(baseInstance(resourceB.Instances()["b-two"]).(*partition).dev).To(BeIdenticalTo(oldB2))
+		Consistently(updatesB, 50*time.Millisecond).ShouldNot(Receive())
+	})
+
+	It("uses the previous device route to isolate a templater failure", func() {
+		templateA := ResourceTemplate{Domain: "ydb.tech", Prefix: "part-a"}
+		templateB := ResourceTemplate{Domain: "ydb.tech", Prefix: "part-b"}
+		resourceA := newResource(templateA, map[Id]Instance{})
+		resourceB := newResource(templateB, map[Id]Instance{})
+		DeferCleanup(resourceA.Close)
+		DeferCleanup(resourceB.Close)
+
+		templater := func(dev udev.Device) (*ResourceTemplate, error) {
+			if dev.Property("TEST_FAIL") != "" {
+				return nil, errors.New("temporary templating failure")
+			}
+			return &ResourceTemplate{Domain: "ydb.tech", Prefix: "part-" + dev.Property("TEST_TEMPLATE")}, nil
+		}
+		mapper := func(dev udev.Device) ([]*partition, error) {
+			return []*partition{{domain: "ydb.tech", label: dev.Property("TEST_INSTANCE"), dev: dev}}, nil
+		}
+		isolated := &Scatter[*partition]{
+			templater: templater,
+			mapper:    mapper,
+			routes: map[ResourceTemplate]Resource{
+				templateA: resourceA,
+				templateB: resourceB,
+			},
+			known: make(map[ResourceTemplate]map[Id]Instance),
+		}
+		device := func(syspath, route, instance string, fail bool) *mockDevice {
+			dev := partitionDevice(syspath, "unused")
+			dev.properties["TEST_TEMPLATE"] = route
+			dev.properties["TEST_INSTANCE"] = instance
+			if fail {
+				dev.properties["TEST_FAIL"] = "true"
+			}
+			return dev
+		}
+
+		oldA := device("device-a", "a", "a-old", false)
+		oldB := device("device-b", "b", "b-old", false)
+		isolated.applySnapshot(udev.Snapshot{Generation: 1, Devices: []udev.Device{oldA, oldB}})
+
+		newA := device("device-a", "a", "a-new", false)
+		failedB := device("device-b", "b", "ignored", true)
+		isolated.applySnapshot(udev.Snapshot{Generation: 2, Devices: []udev.Device{newA, failedB}})
+
+		Expect(resourceA.Devices()).To(ContainElement(And(
+			HaveField("ID", "a-new"),
+			HaveField("Health", "Healthy"),
+		)))
+		Expect(resourceB.Devices()).To(ConsistOf(And(
+			HaveField("ID", "b-old"),
+			HaveField("Health", "Healthy"),
+		)))
+		Expect(baseInstance(resourceB.Instances()["b-old"]).(*partition).dev).To(BeIdenticalTo(oldB))
+	})
+
+	It("preserves every resource when a failure cannot be attributed", func() {
+		dev := partitionDevice("nvme0n1p1", "nvme_disk01")
+		scatter.applySnapshot(udev.Snapshot{Generation: 1, Devices: []udev.Device{dev}})
+		Eventually(updates).Should(Receive())
+
+		scatter.applySnapshot(udev.Snapshot{Generation: 2, Devices: []udev.Device{nil}})
+
+		Expect(res.Devices()).To(ConsistOf(And(
+			HaveField("ID", "disk01"),
+			HaveField("Health", "Healthy"),
+		)))
+		Consistently(updates, 50*time.Millisecond).ShouldNot(Receive())
+	})
+
 	It("rejects a nil mapped instance without mutating live state", func() {
 		dev := partitionDevice("nvme0n1p1", "nvme_disk01")
 		scatter.applySnapshot(udev.Snapshot{Generation: 1, Devices: []udev.Device{dev}})

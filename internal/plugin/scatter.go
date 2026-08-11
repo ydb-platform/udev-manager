@@ -15,11 +15,12 @@ import (
 // into complete desired Resource states. Each resource is committed once per
 // snapshot, regardless of how many devices changed.
 type Scatter[T Instance] struct {
-	templater FromDevice[*ResourceTemplate]
-	mapper    FromDevice[[]T]
-	registry  *Registry
-	routes    map[ResourceTemplate]Resource
-	known     map[ResourceTemplate]map[Id]Instance
+	templater      FromDevice[*ResourceTemplate]
+	mapper         FromDevice[[]T]
+	registry       *Registry
+	routes         map[ResourceTemplate]Resource
+	known          map[ResourceTemplate]map[Id]Instance
+	deviceTemplate map[udev.Id]ResourceTemplate
 }
 
 // NewScatter creates a Scatter that projects full discovery snapshots. The
@@ -32,11 +33,12 @@ func NewScatter[T Instance](
 	mapper FromDevice[[]T],
 ) mux.CancelFunc {
 	scatter := &Scatter[T]{
-		templater: templater,
-		mapper:    mapper,
-		registry:  registry,
-		routes:    make(map[ResourceTemplate]Resource),
-		known:     make(map[ResourceTemplate]map[Id]Instance),
+		templater:      templater,
+		mapper:         mapper,
+		registry:       registry,
+		routes:         make(map[ResourceTemplate]Resource),
+		known:          make(map[ResourceTemplate]map[Id]Instance),
+		deviceTemplate: make(map[udev.Id]ResourceTemplate),
 	}
 	ch := make(chan udev.Snapshot)
 	runDone := make(chan struct{})
@@ -52,45 +54,155 @@ func NewScatter[T Instance](
 	}
 }
 
-// stage maps a complete device snapshot without mutating live resources. If
-// any mapper returns an error, the whole projection is abandoned so a
-// transient mapping failure cannot masquerade as removal of healthy devices.
-func (s *Scatter[T]) stage(devices []udev.Device) (map[ResourceTemplate]map[Id]Instance, error) {
-	desired := make(map[ResourceTemplate]map[Id]Instance)
+type scatterStage struct {
+	present        map[ResourceTemplate]map[Id]Instance
+	failed         map[ResourceTemplate]struct{}
+	deviceTemplate map[udev.Id]ResourceTemplate
+	failedDevices  map[udev.Id]struct{}
+	seenDevices    map[udev.Id]struct{}
+	dependencies   map[ResourceTemplate]map[ResourceTemplate]struct{}
+	errors         []error
+	globalFailure  bool
+}
+
+func newScatterStage() *scatterStage {
+	return &scatterStage{
+		present:        make(map[ResourceTemplate]map[Id]Instance),
+		failed:         make(map[ResourceTemplate]struct{}),
+		deviceTemplate: make(map[udev.Id]ResourceTemplate),
+		failedDevices:  make(map[udev.Id]struct{}),
+		seenDevices:    make(map[udev.Id]struct{}),
+		dependencies:   make(map[ResourceTemplate]map[ResourceTemplate]struct{}),
+	}
+}
+
+func (stage *scatterStage) fail(err error, templates ...ResourceTemplate) {
+	stage.errors = append(stage.errors, err)
+	for _, template := range templates {
+		stage.failed[template] = struct{}{}
+	}
+}
+
+func (stage *scatterStage) depend(a, b ResourceTemplate) {
+	if a == b {
+		return
+	}
+	if stage.dependencies[a] == nil {
+		stage.dependencies[a] = make(map[ResourceTemplate]struct{})
+	}
+	if stage.dependencies[b] == nil {
+		stage.dependencies[b] = make(map[ResourceTemplate]struct{})
+	}
+	stage.dependencies[a][b] = struct{}{}
+	stage.dependencies[b][a] = struct{}{}
+}
+
+// propagateFailures keeps a device move atomic across its old and new
+// templates. If either side cannot be projected, neither side is committed.
+func (stage *scatterStage) propagateFailures() {
+	for changed := true; changed; {
+		changed = false
+		for failed := range stage.failed {
+			for dependent := range stage.dependencies[failed] {
+				if _, ok := stage.failed[dependent]; ok {
+					continue
+				}
+				stage.failed[dependent] = struct{}{}
+				changed = true
+			}
+		}
+	}
+}
+
+// stage maps a complete device snapshot without mutating live resources.
+// Failures are recorded per resource template: a bad device preserves that
+// template's last committed state without preventing unrelated templates from
+// advancing. Prior device routes identify the affected template even when the
+// templater itself fails transiently.
+func (s *Scatter[T]) stage(devices []udev.Device) *scatterStage {
+	stage := newScatterStage()
 	for _, dev := range devices {
 		if dev == nil {
-			return nil, fmt.Errorf("device is nil")
+			stage.errors = append(stage.errors, fmt.Errorf("device is nil"))
+			stage.globalFailure = true
+			continue
 		}
+		deviceID := dev.Id()
+		stage.seenDevices[deviceID] = struct{}{}
+		previousTemplate, previouslyMapped := s.deviceTemplate[deviceID]
 
 		template, err := s.templater(dev)
 		if err != nil {
-			return nil, fmt.Errorf("create resource template for device %q: %w", dev.Debug(), err)
+			wrapped := fmt.Errorf("create resource template for device %q: %w", dev.Debug(), err)
+			stage.failedDevices[deviceID] = struct{}{}
+			if template != nil && previouslyMapped {
+				stage.fail(wrapped, *template, previousTemplate)
+			} else if template != nil {
+				stage.fail(wrapped, *template)
+			} else if previouslyMapped {
+				stage.fail(wrapped, previousTemplate)
+			} else {
+				stage.errors = append(stage.errors, wrapped)
+				stage.globalFailure = true
+			}
+			continue
 		}
 		if template == nil {
 			continue
 		}
+		if previouslyMapped {
+			stage.depend(previousTemplate, *template)
+		}
 
 		instances, err := s.mapper(dev)
 		if err != nil {
-			return nil, fmt.Errorf("map device %q to instances: %w", dev.Debug(), err)
+			wrapped := fmt.Errorf("map device %q to instances: %w", dev.Debug(), err)
+			stage.failedDevices[deviceID] = struct{}{}
+			if previouslyMapped {
+				stage.fail(wrapped, *template, previousTemplate)
+			} else {
+				stage.fail(wrapped, *template)
+			}
+			continue
 		}
-		byID, ok := desired[*template]
+		byID, ok := stage.present[*template]
 		if !ok {
 			byID = make(map[Id]Instance)
-			desired[*template] = byID
+			stage.present[*template] = byID
 		}
+		valid := true
 		for _, instance := range instances {
 			if nilInstance(instance) {
-				return nil, fmt.Errorf("device %q mapped to a nil instance", dev.Debug())
+				wrapped := fmt.Errorf("device %q mapped to a nil instance", dev.Debug())
+				stage.failedDevices[deviceID] = struct{}{}
+				if previouslyMapped {
+					stage.fail(wrapped, *template, previousTemplate)
+				} else {
+					stage.fail(wrapped, *template)
+				}
+				valid = false
+				break
 			}
 			id := instance.Id()
 			if _, duplicate := byID[id]; duplicate {
-				return nil, fmt.Errorf("multiple devices map to resource %s/%s instance %q", template.Domain, template.Prefix, id)
+				wrapped := fmt.Errorf("multiple devices map to resource %s/%s instance %q", template.Domain, template.Prefix, id)
+				stage.failedDevices[deviceID] = struct{}{}
+				if previouslyMapped {
+					stage.fail(wrapped, *template, previousTemplate)
+				} else {
+					stage.fail(wrapped, *template)
+				}
+				valid = false
+				break
 			}
 			byID[id] = instance
 		}
+		if valid {
+			stage.deviceTemplate[deviceID] = *template
+		}
 	}
-	return desired, nil
+	stage.propagateFailures()
+	return stage
 }
 
 func nilInstance(instance Instance) bool {
@@ -124,6 +236,9 @@ func (s *Scatter[T]) initializeKnown() {
 	if s.known == nil {
 		s.known = make(map[ResourceTemplate]map[Id]Instance)
 	}
+	if s.deviceTemplate == nil {
+		s.deviceTemplate = make(map[udev.Id]ResourceTemplate)
+	}
 	for template, resource := range s.routes {
 		if _, ok := s.known[template]; ok {
 			continue
@@ -136,22 +251,73 @@ func (s *Scatter[T]) initializeKnown() {
 	}
 }
 
+func (s *Scatter[T]) commitDeviceTemplates(stage *scatterStage) {
+	next := make(map[udev.Id]ResourceTemplate, len(stage.deviceTemplate))
+
+	// An absent device is forgotten only after its old template accepted the
+	// authoritative absence. If that template failed, retain the route so a
+	// later templater failure can still be isolated correctly.
+	for deviceID, previousTemplate := range s.deviceTemplate {
+		if _, seen := stage.seenDevices[deviceID]; seen {
+			continue
+		}
+		if _, failed := stage.failed[previousTemplate]; failed {
+			next[deviceID] = previousTemplate
+		}
+	}
+
+	for deviceID := range stage.seenDevices {
+		previousTemplate, previouslyMapped := s.deviceTemplate[deviceID]
+		if _, failed := stage.failedDevices[deviceID]; failed {
+			if previouslyMapped {
+				next[deviceID] = previousTemplate
+			}
+			continue
+		}
+
+		currentTemplate, currentlyMapped := stage.deviceTemplate[deviceID]
+		if currentlyMapped {
+			if _, failed := stage.failed[currentTemplate]; !failed {
+				next[deviceID] = currentTemplate
+			} else if previouslyMapped {
+				next[deviceID] = previousTemplate
+			}
+			continue
+		}
+
+		// A successful non-match removes the old route unless its resource was
+		// held back transactionally because another device failed.
+		if previouslyMapped {
+			if _, failed := stage.failed[previousTemplate]; failed {
+				next[deviceID] = previousTemplate
+			}
+		}
+	}
+
+	s.deviceTemplate = next
+}
+
 // applySnapshot stages and atomically commits a full projection per resource.
 // Historical instance IDs are retained as Unhealthy tombstones, preserving
 // the previous device-plugin behavior for removed devices.
 func (s *Scatter[T]) applySnapshot(snapshot udev.Snapshot) {
-	present, err := s.stage(snapshot.Devices)
-	if err != nil {
-		klog.Errorf("scatter: failed to stage discovery generation %d: %v", snapshot.Generation, err)
+	s.initializeKnown()
+	stage := s.stage(snapshot.Devices)
+	for _, err := range stage.errors {
+		klog.Errorf("scatter: failed to stage part of discovery generation %d: %v", snapshot.Generation, err)
+	}
+	if stage.globalFailure {
+		// Without a current or historical route, a failure cannot be scoped to
+		// a resource safely. Preserve the whole last-good projection rather
+		// than treating unknown devices as authoritative removals.
 		return
 	}
 
-	s.initializeKnown()
-	templateSet := make(map[ResourceTemplate]struct{}, len(s.known)+len(present))
+	templateSet := make(map[ResourceTemplate]struct{}, len(s.known)+len(stage.present))
 	for template := range s.known {
 		templateSet[template] = struct{}{}
 	}
-	for template := range present {
+	for template := range stage.present {
 		templateSet[template] = struct{}{}
 	}
 	templates := make([]ResourceTemplate, 0, len(templateSet))
@@ -166,7 +332,10 @@ func (s *Scatter[T]) applySnapshot(snapshot udev.Snapshot) {
 	})
 
 	for _, template := range templates {
-		current, observed := present[template]
+		if _, failed := stage.failed[template]; failed {
+			continue
+		}
+		current, observed := stage.present[template]
 		known := s.known[template]
 		if known == nil {
 			known = make(map[Id]Instance)
@@ -210,6 +379,8 @@ func (s *Scatter[T]) applySnapshot(snapshot udev.Snapshot) {
 		}
 		s.routes[template] = resource
 	}
+
+	s.commitDeviceTemplates(stage)
 }
 
 func (s *Scatter[T]) run(snapshotCh <-chan udev.Snapshot) {
