@@ -378,6 +378,9 @@ func (nbc *netBWConfig) validate() error {
 	if err != nil {
 		return fmt.Errorf(".matcher: %q must be a valid regexp: %w", nbc.Matcher, err)
 	}
+	if nbc.MbpsPerShare == 0 {
+		return fmt.Errorf(".mbpsPerShare: must be positive")
+	}
 	nbc.matcher = matcher
 	return nil
 }

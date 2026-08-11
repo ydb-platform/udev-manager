@@ -236,8 +236,13 @@ var _ = Describe("netBWConfig.validate", func() {
 		Expect(nc.validate()).To(MatchError(ContainSubstring(".matcher")))
 	})
 
+	It("rejects zero Mbps per share", func() {
+		nc := &netBWConfig{Matcher: `eth.*`}
+		Expect(nc.validate()).To(MatchError(ContainSubstring(".mbpsPerShare")))
+	})
+
 	It("compiles matcher so it can be used after validate", func() {
-		nc := &netBWConfig{Matcher: `eth\d+`}
+		nc := &netBWConfig{Matcher: `eth\d+`, MbpsPerShare: 100}
 		Expect(nc.validate()).NotTo(HaveOccurred())
 		Expect(nc.matcher.MatchString("eth0")).To(BeTrue())
 		Expect(nc.matcher.MatchString("wlan0")).To(BeFalse())
@@ -356,6 +361,31 @@ networkBandwidth:
 		Expect(cfg.NetworkBandwidth).To(HaveLen(1))
 		Expect(cfg.NetworkBandwidth[0].MbpsPerShare).To(BeEquivalentTo(100))
 		Expect(cfg.NetworkBandwidth[0].matcher).NotTo(BeNil())
+	})
+
+	It("rejects networkBandwidth with omitted mbpsPerShare", func() {
+		_, err := parseYAML(`
+domain: ydb.tech
+networkBandwidth:
+  - matcher: "eth(.*)"
+`)
+		Expect(err).To(MatchError(And(
+			ContainSubstring(".networkBandwidth[0]"),
+			ContainSubstring(".mbpsPerShare"),
+		)))
+	})
+
+	It("rejects networkBandwidth with explicit zero mbpsPerShare", func() {
+		_, err := parseYAML(`
+domain: ydb.tech
+networkBandwidth:
+  - matcher: "eth(.*)"
+    mbpsPerShare: 0
+`)
+		Expect(err).To(MatchError(And(
+			ContainSubstring(".networkBandwidth[0]"),
+			ContainSubstring(".mbpsPerShare"),
+		)))
 	})
 
 	It("parses networkRdma section", func() {
