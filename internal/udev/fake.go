@@ -195,9 +195,10 @@ func (f *FakeDiscovery) Emit(ev Event) {
 // unsubscribes sink.
 //
 // The Init delivery and mux subscription are performed atomically under a
-// write lock to prevent races with [Emit]. The sink must not block in Submit
-// (e.g., use a buffered channel) to avoid holding the lock.
+// write lock to prevent races with [Emit]. As in real discovery, a queue keeps
+// a slow sink from blocking shared delivery while preserving event order.
 func (f *FakeDiscovery) Subscribe(sink mux.Sink[Event]) mux.CancelFunc {
+	sink = newEventQueue(sink)
 	// Hold the write lock across both the Init delivery and the mux
 	// subscription so that no Emit can interleave between the two steps.
 	f.mu.Lock()
