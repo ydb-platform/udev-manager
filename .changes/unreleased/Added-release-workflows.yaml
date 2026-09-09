@@ -1,3 +1,0 @@
-kind: Added
-body: Add a Changie release-PR workflow and publish Git tags with release notes after merge, without uploading build artifacts.
-time: 2026-09-09T00:00:00Z
