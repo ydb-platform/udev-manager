@@ -4,6 +4,8 @@ Kubernetes device plugin that exposes udev-managed devices (disk partitions, net
 
 ## Quick start
 
+For changelog fragments and releases, see [Release flow](docs/release-flow.md).
+
 1. Build an image for deployment
 
 ```bash
