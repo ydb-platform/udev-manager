@@ -40,12 +40,22 @@ The binary accepts a `--config` flag with one of:
 |---|---|---|
 | `domain` | string | **Required.** Resource domain (e.g. `ydb.tech`). |
 | `disable_topology_hints` | bool | Disable NUMA topology hints for partition devices. |
-| `health_check_port` | uint16 | Port for `/healthz` endpoint (default: `8080`). |
+| `health_check_port` | uint16 | Port for `/healthz` and `/metrics` endpoints (default: `8080`). |
 | `partitions` | list | Expose each matching partition as its own resource. |
 | `batchPartitions` | list | Group matching partitions into a single resource. |
 | `networkBandwidth` | list | Expose network bandwidth shares as resources. |
 | `networkRdma` | list | Expose RDMA device resources. |
 | `numaAffinity` | list | Expose statically-configured resources that fake NUMA affinity. |
+
+### Queue metrics
+
+`/metrics` exposes two Prometheus gauges: `udev_manager_discovery_queue_events`
+(sum across discovery queues) and `udev_manager_discovery_queue_max_events`
+(largest individual queue). Both include delivery blocked on a subscriber,
+but exclude events already accepted by its channel. An initial device snapshot
+counts as one event, so these are event counts, not memory usage or device counts.
+Both return zero when all queues are drained. Configure scraping separately;
+sustained backlog can be used for a later alert.
 
 ### Partitions
 

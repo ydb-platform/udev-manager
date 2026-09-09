@@ -488,14 +488,18 @@ func (d *udevDiscovery) monitor(wg *sync.WaitGroup) {
 }
 
 func (d *udevDiscovery) Subscribe(sink mux.Sink[Event]) mux.CancelFunc {
+	// Queue Init and subsequent deltas through the same worker to preserve
+	// ordering without letting a slow subscriber block the shared mux.
+	queue := newEventQueue(sink)
 	// here we're doing initialization in monitor goroutine
 	// to be able to pass consistent Init event to the sink
 	// before making fan out of udev events
-	await := mux.NewAwaitReply[monitorRequest, any](newSub{sink})
+	await := mux.NewAwaitReply[monitorRequest, any](newSub{queue})
 	select {
 	case d.requests <- await:
 		return await.Await().(mux.CancelFunc)
 	case <-d.done:
+		queue.Close()
 		return func() {}
 	}
 }

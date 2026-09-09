@@ -52,6 +52,7 @@ func main() {
 	klog.Infof("Starting /healthz server on port %s", healthCheckAddr)
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/healthz", registry.Healthz)
+	healthMux.HandleFunc("/metrics", udev.QueueMetrics)
 	healthSrv := &http.Server{Addr: healthCheckAddr, Handler: healthMux}
 	go func() {
 		if err := healthSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
