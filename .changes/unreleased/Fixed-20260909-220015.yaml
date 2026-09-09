@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Stop dropping udev events: introduce queue before each sink'
+time: 2026-09-09T22:00:15.117298094+02:00
