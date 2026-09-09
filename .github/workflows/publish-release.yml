@@ -1,0 +1,63 @@
+name: publish-release
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read version
+        id: latest
+        uses: miniscruff/changie-action@v2
+        with:
+          version: v1.26.0
+          args: latest
+
+      - name: Publish tag and release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CHANGELOG_VERSION: ${{ steps.latest.outputs.output }}
+          RELEASE_BRANCH: ${{ github.event.pull_request.head.ref }}
+          RELEASE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CHANGELOG_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$RELEASE_BRANCH" == "release/$CHANGELOG_VERSION" ]]
+          tag="${CHANGELOG_VERSION#v}"
+          notes=".changes/$CHANGELOG_VERSION.md"
+          test -s "$notes"
+
+          # Never move an existing tag. A rerun may finish a partial publication.
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            [[ "$(git rev-parse "refs/tags/$tag^{commit}")" == "$RELEASE_SHA" ]]
+            if gh release view "$tag" > /dev/null 2>&1; then
+              echo "Release $tag already exists; leaving it unchanged."
+              exit 0
+            fi
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" --silent \
+              -f "ref=refs/tags/$tag" -f "sha=$RELEASE_SHA"
+          fi
+          gh release create "$tag" --verify-tag --target "$RELEASE_SHA" \
+            --title "$tag" --notes-file "$notes"

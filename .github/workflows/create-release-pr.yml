@@ -1,0 +1,70 @@
+name: create-release-pr
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: Version increment
+        type: choice
+        required: true
+        default: patch
+        options: [patch, minor, major]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: create-release-pr
+  cancel-in-progress: false
+
+jobs:
+  create-release-pr:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Require unreleased changes
+        env:
+          BUMP_TYPE: ${{ inputs.bump_type }}
+        run: |
+          case "$BUMP_TYPE" in patch|minor|major) ;; *) exit 1 ;; esac
+          test -n "$(git ls-files '.changes/unreleased/*.yaml')"
+
+      - name: Batch changes
+        uses: miniscruff/changie-action@v2
+        with:
+          version: v1.26.0
+          args: batch ${{ inputs.bump_type }}
+
+      - name: Merge changelog
+        uses: miniscruff/changie-action@v2
+        with:
+          version: v1.26.0
+          args: merge
+
+      - name: Read version
+        id: latest
+        uses: miniscruff/changie-action@v2
+        with:
+          version: v1.26.0
+          args: latest
+
+      - name: Create release PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ github.token }}
+          base: main
+          branch: release/${{ steps.latest.outputs.output }}
+          title: Release ${{ steps.latest.outputs.output }}
+          commit-message: Release ${{ steps.latest.outputs.output }}
+          add-paths: |
+            .changes/
+            CHANGELOG.md
+          body: |
+            Review the batched changes in `.changes/${{ steps.latest.outputs.output }}.md`.
+            Merging this PR publishes a Git tag and a GitHub release with these notes.
+            No build artifacts are uploaded.
