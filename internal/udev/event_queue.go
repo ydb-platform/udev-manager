@@ -3,6 +3,7 @@ package udev
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"k8s.io/klog/v2"
 
@@ -19,12 +20,14 @@ type eventQueue struct {
 	ready   *sync.Cond
 	pending []Event
 	closed  bool
+	backlog atomic.Int64 // Includes the event currently being delivered.
 	done    chan struct{}
 }
 
 func newEventQueue(sink mux.Sink[Event]) *eventQueue {
 	q := &eventQueue{sink: sink, done: make(chan struct{})}
 	q.ready = sync.NewCond(&q.mu)
+	eventQueues.Store(q, struct{}{})
 	go q.run()
 	return q
 }
@@ -36,6 +39,7 @@ func (q *eventQueue) Submit(ev Event) error {
 		return fmt.Errorf("udev: event queue is closed")
 	}
 	q.pending = append(q.pending, ev)
+	q.backlog.Add(1)
 	q.ready.Signal()
 	return nil
 }
@@ -52,6 +56,7 @@ func (q *eventQueue) Close() {
 
 func (q *eventQueue) run() {
 	defer close(q.done)
+	defer eventQueues.Delete(q)
 	defer q.sink.Close()
 	for {
 		q.mu.Lock()
@@ -73,5 +78,6 @@ func (q *eventQueue) run() {
 		if err := q.sink.Submit(ev); err != nil {
 			klog.Errorf("udev: failed to deliver queued event: %v", err)
 		}
+		q.backlog.Add(-1)
 	}
 }
