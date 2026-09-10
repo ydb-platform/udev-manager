@@ -1,3 +1,0 @@
-kind: Added
-body: Expose total and maximum discovery queue backlog at /metrics.
-time: 2026-09-10T00:00:00Z
