@@ -49,13 +49,10 @@ The binary accepts a `--config` flag with one of:
 
 ### Queue metrics
 
-`/metrics` exposes two Prometheus gauges: `udev_manager_discovery_queue_events`
-(sum across discovery queues) and `udev_manager_discovery_queue_max_events`
-(largest individual queue). Both include delivery blocked on a subscriber,
-but exclude events already accepted by its channel. An initial device snapshot
-counts as one event, so these are event counts, not memory usage or device counts.
-Both return zero when all queues are drained. Configure scraping separately;
-sustained backlog can be used for a later alert.
+`/metrics` on the health-check port exposes two gauges, including blocked delivery:
+
+- `udev_manager_discovery_queue_events`: total queued events.
+- `udev_manager_discovery_queue_max_events`: largest queue.
 
 ### Partitions
 
