@@ -1,0 +1,3 @@
+kind: Fixed
+body: Check if a matched network interface is RDMA enabled before registering it to kubernetes
+time: 2026-09-10T11:51:22.339221+02:00
