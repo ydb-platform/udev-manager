@@ -784,6 +784,36 @@ partitions:
 		})
 	})
 
+	Describe("Kubelet drops ListAndWatch stream", func() {
+		It("re-registers when the stream breaks without a kubelet restart", func() {
+			dev := makePartitionDevice("/sys/block/nvme0n1/nvme0n1p1", "/dev/nvme0n1p1", "nvme_disk01")
+			discovery.AddDevice(dev)
+
+			config := mustParseYAML(`
+domain: ydb.tech
+partitions:
+  - matcher: "nvme_(.*)"
+`)
+			startTestApp(ctx, wg, discovery, config, tmpDir, kubeSock)
+			waitForRegistrations(kubelet, 1)
+			sockets := waitForSockets(tmpDir)
+
+			By("opening a ListAndWatch stream, as kubelet would")
+			client, conn := dialPlugin(sockets[0])
+			stream, err := client.ListAndWatch(ctx, &pluginapi.Empty{})
+			Expect(err).NotTo(HaveOccurred())
+			recvWithTimeout(stream, 5*time.Second)
+
+			By("dropping the connection without recreating the kubelet socket")
+			conn.Close()
+
+			By("the plugin re-registers on its own")
+			waitForRegistrations(kubelet, 2)
+			reg := kubelet.Registrations()[1]
+			Expect(reg.ResourceName).To(Equal("ydb.tech/part-disk01"))
+		})
+	})
+
 	Describe("Shutdown", func() {
 		It("terminates ListAndWatch stream when context is cancelled", func() {
 			dev := makePartitionDevice("/sys/block/nvme0n1/nvme0n1p1", "/dev/nvme0n1p1", "nvme_disk01")
