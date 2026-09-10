@@ -1,6 +1,8 @@
 package udev
 
 import (
+	"fmt"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -63,7 +65,26 @@ func TestDiscoverySlowSubscriberRetainsEvents(t *testing.T) {
 
 func TestEventQueueCloseDrainsAcceptedEvents(t *testing.T) {
 	events := make(chan Event)
-	q := newEventQueue(mux.SinkFromChan(events))
+	delivering := make(chan Event, 2)
+	q := newEventQueue(mux.ThenSink(mux.SinkFromChan(events), func(ev Event) Event {
+		delivering <- ev
+		return ev
+	}))
+	otherEvents := make(chan Event)
+	other := newEventQueue(mux.SinkFromChan(otherEvents))
+	defer func() {
+		go func() {
+			for range events {
+			}
+		}()
+		go func() {
+			for range otherEvents {
+			}
+		}()
+		q.Close()
+		other.Close()
+	}()
+	assertQueueMetrics(t, 0, 0)
 	dev := NewFakeDevice("disk1")
 	want := []Event{Init{Devices: []Device{dev}}, Removed{dev}}
 	for _, ev := range want {
@@ -71,6 +92,15 @@ func TestEventQueueCloseDrainsAcceptedEvents(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := other.Submit(Removed{dev}); err != nil {
+		t.Fatal(err)
+	}
+	// Neither unbuffered subscriber is reading: include blocked deliveries.
+	receiveEvent(t, delivering)
+	assertQueueMetrics(t, 3, 2)
+	receiveEvent(t, otherEvents)
+	other.Close()
+	assertQueueMetrics(t, 2, 2)
 	var closers sync.WaitGroup
 	for i := 0; i < 2; i++ {
 		closers.Add(1)
@@ -90,5 +120,24 @@ func TestEventQueueCloseDrainsAcceptedEvents(t *testing.T) {
 	closers.Wait()
 	if err := q.Submit(Removed{dev}); err == nil {
 		t.Fatal("submission after Close succeeded")
+	}
+	assertQueueMetrics(t, 0, 0)
+	if _, exists := eventQueues.Load(q); exists {
+		t.Fatal("closed queue retained in metrics registry")
+	}
+}
+
+func assertQueueMetrics(t *testing.T, total, largest int) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	QueueMetrics(w, httptest.NewRequest("GET", "/metrics", nil))
+	want := fmt.Sprintf("# HELP udev_manager_discovery_queue_events Events awaiting discovery delivery across all queues, including in-flight delivery.\n"+
+		"# TYPE udev_manager_discovery_queue_events gauge\n"+
+		"udev_manager_discovery_queue_events %d\n"+
+		"# HELP udev_manager_discovery_queue_max_events Largest discovery delivery backlog, including in-flight delivery.\n"+
+		"# TYPE udev_manager_discovery_queue_max_events gauge\n"+
+		"udev_manager_discovery_queue_max_events %d\n", total, largest)
+	if w.Code != 200 || w.Header().Get("Content-Type") != "text/plain; version=0.0.4; charset=utf-8" || w.Body.String() != want {
+		t.Fatalf("unexpected metrics response: %d %v %s", w.Code, w.Header(), w.Body)
 	}
 }

@@ -40,12 +40,19 @@ The binary accepts a `--config` flag with one of:
 |---|---|---|
 | `domain` | string | **Required.** Resource domain (e.g. `ydb.tech`). |
 | `disable_topology_hints` | bool | Disable NUMA topology hints for partition devices. |
-| `health_check_port` | uint16 | Port for `/healthz` endpoint (default: `8080`). |
+| `health_check_port` | uint16 | Port for `/healthz` and `/metrics` endpoints (default: `8080`). |
 | `partitions` | list | Expose each matching partition as its own resource. |
 | `batchPartitions` | list | Group matching partitions into a single resource. |
 | `networkBandwidth` | list | Expose network bandwidth shares as resources. |
 | `networkRdma` | list | Expose RDMA device resources. |
 | `numaAffinity` | list | Expose statically-configured resources that fake NUMA affinity. |
+
+### Queue metrics
+
+`/metrics` on the health-check port exposes two gauges, including blocked delivery:
+
+- `udev_manager_discovery_queue_events`: total queued events.
+- `udev_manager_discovery_queue_max_events`: largest queue.
 
 ### Partitions
 
