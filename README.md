@@ -96,7 +96,14 @@ Exposes RDMA character devices for a network interface.
 networkRdma:
   - matcher: '(^ib0$)'
     resourceCount: 4
+    deviceType: vf            # optional: vf or pf
 ```
+
+Only interfaces with an RDMA-device mapping are exposed. `deviceType: vf`
+requires the interface's PCI function to have a `physfn` attribute;
+`deviceType: pf` requires a positive `sriov_totalvfs` value. Omitting
+`deviceType` disables PF/VF filtering. The `pf` and `vf` values are
+case-insensitive.
 
 ### Numa affinity
 
