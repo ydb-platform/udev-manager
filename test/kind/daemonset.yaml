@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: udev-manager
+  namespace: udev-manager-e2e
+spec:
+  selector:
+    matchLabels:
+      app: udev-manager
+  template:
+    metadata:
+      labels:
+        app: udev-manager
+    spec:
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: udev-manager
+          image: udev-manager:kind-e2e
+          imagePullPolicy: Never
+          env:
+            - name: UDEV_MANAGER_ARGS
+              value: -v=5
+          securityContext:
+            privileged: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/udev-manager
+              readOnly: true
+            - name: host-dev
+              mountPath: /dev
+            - name: host-sys
+              mountPath: /sys
+              readOnly: true
+            - name: host-udev
+              mountPath: /run/udev
+              readOnly: true
+            - name: device-plugins
+              mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+        - name: config
+          configMap:
+            name: udev-manager-config
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: host-udev
+          hostPath:
+            path: /run/udev
+            type: DirectoryOrCreate
+        - name: device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory

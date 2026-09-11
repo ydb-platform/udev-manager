@@ -1,0 +1,26 @@
+domain: devices.example
+health_check_port: 8080
+partitions:
+  - matcher: '^e2e_disk-(.*)$'
+batchPartitions:
+  - name: data
+    matcher: '^e2e_batch_(.*)$'
+    count: 2
+networkBandwidth:
+  - matcher: '^e2ebw-(.*)$'
+    mbpsPerShare: 1000
+networkRdma:
+  - matcher: '^e2erdma-(any)$'
+    resourceCount: 2
+  - matcher: '^e2erdma-(pf)$'
+    resourceCount: 1
+    deviceType: PF
+  - matcher: '^e2erdma-(vf)$'
+    resourceCount: 1
+    deviceType: vF
+  - matcher: '^e2e(nonrdma)$'
+    resourceCount: 1
+numaAffinity:
+  - name: node0
+    numaNode: 0
+    count: 2
