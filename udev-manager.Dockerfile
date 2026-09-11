@@ -3,8 +3,12 @@ FROM golang:1.24-bookworm as build
 WORKDIR /go/app
 COPY . /go/app
 
-RUN apt update && apt install -y libudev-dev
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o udev-manager cmd/udev-manager/main.go
+ARG GOARCH=amd64
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libudev-dev && \
+    rm -rf /var/lib/apt/lists/*
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=${GOARCH} go build -o udev-manager ./cmd/udev-manager
 
 FROM debian:bookworm
 

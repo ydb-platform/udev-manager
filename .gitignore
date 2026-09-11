@@ -30,3 +30,6 @@ go.work.sum
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Kind end-to-end test diagnostics
+_artifacts/

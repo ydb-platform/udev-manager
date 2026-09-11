@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: udevd
+  namespace: udev-manager-e2e
+spec:
+  selector:
+    matchLabels:
+      app: udevd
+  template:
+    metadata:
+      labels:
+        app: udevd
+    spec:
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: udevd
+          image: udev-manager-device-lab:kind-e2e
+          imagePullPolicy: Never
+          command:
+            - /bin/sh
+            - -ec
+          args:
+            - rm -f /run/udev/control; exec /lib/systemd/systemd-udevd --resolve-names=never
+          securityContext:
+            privileged: true
+          readinessProbe:
+            exec:
+              command:
+                - udevadm
+                - control
+                - --ping
+            periodSeconds: 1
+          volumeMounts:
+            - name: host-dev
+              mountPath: /dev
+            - name: host-sys
+              mountPath: /sys
+            - name: host-udev
+              mountPath: /run/udev
+      volumes:
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: host-udev
+          hostPath:
+            path: /run/udev
+            type: DirectoryOrCreate

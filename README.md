@@ -128,6 +128,70 @@ make build   # compile
 make test    # run tests with -race
 ```
 
+### Kind development cluster and E2E tests
+
+The Kind cluster runs the `udev-manager` executable against devices
+created by the Linux kernel. It uses GPT-labelled NBD partitions, veth pairs,
+and software RDMA (`rdma_rxe`, with `siw` as a fallback). The devices have real
+sysfs entries, udev records, and `/dev/infiniband` character devices.
+Device construction and the test `udevd` run only in a separate test-toolbox
+image; the production image still contains only the normal `udev-manager`
+executable and runtime dependencies. Both normal builds and the Kind tests use
+the root `udev-manager.Dockerfile`; Docker builds it for the current platform.
+
+Linux requires a rootful Docker daemon and kernel support for NBD partitions
+plus either `rdma_rxe` or `siw`.
+On macOS, it starts OrbStack when necessary and uses its `orbstack`
+Docker context without changing the global Docker context. `docker`, `kind`,
+`kubectl`, and Go must be on `PATH`; macOS additionally requires `orbctl`.
+
+```bash
+make kind-up  # leave a populated cluster running for manual testing
+make e2e      # create, test, diagnose on failure, and remove an isolated cluster
+```
+
+The manual cluster has one control-plane and two workers and uses context
+`kind-udev-manager-dev` in the active kubeconfig (`$KUBECONFIG`, or
+`~/.kube/config` by default). It includes shared individual and batch
+partitions, node-local bandwidth and software-RDMA devices, a matched non-RDMA
+interface, RDMA devices rejected by PF/VF filters because they have no PCI
+parent, and a NUMA resource on every node.
+
+```bash
+make kind-device ACTION=status
+make kind-device ACTION=reset
+make kind-device ACTION=seed
+make kind-device ACTION=add-partition \
+  LABEL=e2e_disk-hot SIGNATURE=UDEV_MANAGER_E2E_HOT
+make kind-device ACTION=remove-partition LABEL=e2e_disk-hot
+make kind-device ACTION=add-veth NODE=udev-manager-dev-worker \
+  DEVICE=e2ebw-manual PEER=e2ebw-peer2
+make kind-device ACTION=add-rdma NODE=udev-manager-dev-worker2 \
+  DEVICE=e2erdma-any PEER=e2eany-peer RDMA_DEVICE=rxe_e2eany
+make kind-down
+```
+
+Set `KEEP_E2E_CLUSTER=1` to retain a failed E2E cluster. Diagnostics are written
+under `_artifacts/kind/`. The E2E command uses a temporary context in the active
+kubeconfig and restores the previously selected context when it exits.
+`KIND_CLUSTER_NAME`, `UDEV_MANAGER_IMAGE`, `DEVICE_LAB_IMAGE`, and
+`DOCKER_CONTEXT` can override the defaults.
+
+The Ginkgo suite in `test/e2e` controls devices through the per-node device-lab
+pods. It creates and removes devices between scenarios and generates its
+consumer Jobs from Go; the production application contains no simulation or
+test-control code. NBD devices are shared by the Linux kernel and exposed on
+all Kind nodes, while veth and RDMA devices remain local to their selected node.
+Software-RDMA attachment does not emit a second netdev uevent, so that scenario
+restarts only the target node's manager pod to re-enumerate after attach/remove;
+the partition and bandwidth scenarios exercise live add/remove events directly.
+Set `E2E_FOCUS` to a Ginkgo focus expression when debugging one scenario.
+
+The portable E2E suite does not create positive PCI SR-IOV PF/VF devices;
+those classifications remain covered by unit tests. An RDMA-capable veth has
+no PCI parent and is therefore used to verify that both PF and mixed-case VF
+filters reject an unknown device type.
+
 ## Examples
 
 See the [examples/](examples/) directory for sample configurations.
