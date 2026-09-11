@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.44.1 - 2026-09-11
+### Fixed
+* Check if a matched network interface is RDMA enabled before registering it to kubernetes
+
 ## v0.44.0 - 2026-09-10
 ### Added
 * Expose total and maximum discovery queue backlog at /metrics.
