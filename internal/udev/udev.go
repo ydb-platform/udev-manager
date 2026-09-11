@@ -20,6 +20,7 @@ import (
 const (
 	BlockSubsystem = "block"
 	NetSubsystem   = "net"
+	PciSubsystem   = "pci"
 
 	DeviceTypeKey  = "DEVTYPE"
 	DeviceTypePart = "partition"
@@ -36,6 +37,8 @@ const (
 
 	SysAttrSpeed     = "speed"
 	SysAttrOperstate = "operstate"
+	SysAttrPhysfn    = "physfn"
+	SysAttrTotalVFs  = "sriov_totalvfs"
 
 	ActionAdd     = "add"
 	ActionRemove  = "remove"

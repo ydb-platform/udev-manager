@@ -7,6 +7,8 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	"github.com/ydb-platform/udev-manager/internal/udev"
 )
 
 var _ = Describe("Scatter", func() {
@@ -54,6 +56,27 @@ var _ = Describe("Scatter", func() {
 			dev := partitionDevice("sda1", "data_01")
 			scatter.added(dev)
 			Consistently(watchCh, 50*time.Millisecond).ShouldNot(Receive())
+		})
+	})
+
+	Describe("added without instances", func() {
+		It("does not register a resource for an empty mapper result", func() {
+			emptyTemplate := ResourceTemplate{Domain: "ydb.tech", Prefix: "netrdma-0"}
+			emptyScatter := &Scatter[*partition]{
+				templater: func(udev.Device) (*ResourceTemplate, error) {
+					return &emptyTemplate, nil
+				},
+				mapper: func(udev.Device) ([]*partition, error) {
+					return nil, nil
+				},
+				registry: nil,
+				routes:   make(map[ResourceTemplate]Resource),
+			}
+
+			Expect(func() {
+				emptyScatter.added(partitionDevice("nvme0n1p1", "nvme_disk01"))
+			}).NotTo(Panic())
+			Expect(emptyScatter.routes).To(BeEmpty())
 		})
 	})
 

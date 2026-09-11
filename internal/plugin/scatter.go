@@ -60,6 +60,10 @@ func (s *Scatter[T]) added(dev udev.Device) {
 		klog.Errorf("failed to map device %q to instances, caused by %q", dev.Debug(), err.Error())
 		return
 	}
+	if len(instances) == 0 {
+		klog.V(5).Infof("unmatched device: %q, mapper returned no instances", dev.Debug())
+		return
+	}
 
 	klog.V(5).Infof("Init: Matched device: %q", dev.Debug())
 
@@ -108,6 +112,10 @@ func (s *Scatter[T]) removed(dev udev.Device) {
 	instances, err := s.mapper(dev)
 	if err != nil {
 		klog.Errorf("failed to map device %q to instances for 'Removed', caused by %q", dev.Debug(), err.Error())
+		return
+	}
+	if len(instances) == 0 {
+		klog.V(5).Infof("unmatched device: %q, mapper returned no instances for 'Removed'", dev.Debug())
 		return
 	}
 

@@ -146,7 +146,12 @@ func startApp(
 				discovery,
 				registry,
 				plugin.NetRdmaMatcherTemplater(domain, netRdmaConfig.matcher),
-				plugin.NetRdmaMatcherInstances(domain, netRdmaConfig.matcher, int(netRdmaConfig.ResourceCount)),
+				plugin.NetRdmaMatcherInstances(
+					domain,
+					netRdmaConfig.matcher,
+					int(netRdmaConfig.ResourceCount),
+					netRdmaConfig.DeviceType,
+				),
 			),
 			cancel,
 		)
@@ -380,8 +385,9 @@ func (nbc *netBWConfig) validate() error {
 }
 
 type netRdmaConfig struct {
-	Matcher       string `yaml:"matcher"` // matcher should be a valid regular expression
-	ResourceCount uint   `yaml:"resourceCount"`
+	Matcher       string                   `yaml:"matcher"` // matcher should be a valid regular expression
+	ResourceCount uint                     `yaml:"resourceCount"`
+	DeviceType    plugin.NetRdmaDeviceType `yaml:"deviceType,omitempty"`
 
 	matcher *regexp.Regexp // compiled matcher if the config is valid
 }
@@ -393,6 +399,18 @@ func (nrc *netRdmaConfig) validate() error {
 		return fmt.Errorf(".matcher: %q must be a valid regexp: %w", nrc.Matcher, err)
 	}
 	nrc.matcher = matcher
+	nrc.DeviceType = plugin.NetRdmaDeviceType(strings.ToLower(string(nrc.DeviceType)))
+
+	switch nrc.DeviceType {
+	case plugin.NetRdmaDeviceTypeAny, plugin.NetRdmaDeviceTypePF, plugin.NetRdmaDeviceTypeVF:
+	default:
+		return fmt.Errorf(
+			".deviceType: %q must be either %q, %q, or omitted",
+			nrc.DeviceType,
+			plugin.NetRdmaDeviceTypePF,
+			plugin.NetRdmaDeviceTypeVF,
+		)
+	}
 	return nil
 }
 

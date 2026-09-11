@@ -5,6 +5,8 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	"github.com/ydb-platform/udev-manager/internal/plugin"
 )
 
 // parseYAML is a test helper that parses a YAML string into a appConfig.
@@ -217,6 +219,30 @@ var _ = Describe("netRdmaConfig.validate", func() {
 		nc := &netRdmaConfig{Matcher: `[`}
 		Expect(nc.validate()).To(MatchError(ContainSubstring(".matcher")))
 	})
+
+	DescribeTable("accepts supported device types",
+		func(deviceType, expected plugin.NetRdmaDeviceType) {
+			nc := &netRdmaConfig{Matcher: `ib.*`, DeviceType: deviceType}
+			Expect(nc.validate()).NotTo(HaveOccurred())
+			Expect(nc.DeviceType).To(Equal(expected))
+		},
+		Entry("omitted", plugin.NetRdmaDeviceTypeAny, plugin.NetRdmaDeviceTypeAny),
+		Entry("lowercase PF", plugin.NetRdmaDeviceTypePF, plugin.NetRdmaDeviceTypePF),
+		Entry("uppercase PF", plugin.NetRdmaDeviceType("PF"), plugin.NetRdmaDeviceTypePF),
+		Entry("mixed-case PF", plugin.NetRdmaDeviceType("pF"), plugin.NetRdmaDeviceTypePF),
+		Entry("lowercase VF", plugin.NetRdmaDeviceTypeVF, plugin.NetRdmaDeviceTypeVF),
+		Entry("uppercase VF", plugin.NetRdmaDeviceType("VF"), plugin.NetRdmaDeviceTypeVF),
+		Entry("mixed-case VF", plugin.NetRdmaDeviceType("vF"), plugin.NetRdmaDeviceTypeVF),
+	)
+
+	DescribeTable("rejects unsupported device types",
+		func(deviceType plugin.NetRdmaDeviceType) {
+			nc := &netRdmaConfig{Matcher: `ib.*`, DeviceType: deviceType}
+			Expect(nc.validate()).To(MatchError(ContainSubstring(".deviceType")))
+		},
+		Entry("explicit any", plugin.NetRdmaDeviceType("any")),
+		Entry("unknown value", plugin.NetRdmaDeviceType("nic")),
+	)
 })
 
 var _ = Describe("numaAffinityConfig.validate", func() {
@@ -330,6 +356,18 @@ networkRdma:
 		Expect(cfg.NetworkRdma).To(HaveLen(1))
 		Expect(cfg.NetworkRdma[0].ResourceCount).To(BeEquivalentTo(4))
 		Expect(cfg.NetworkRdma[0].matcher).NotTo(BeNil())
+	})
+
+	It("parses networkRdma deviceType", func() {
+		cfg := mustParseYAML(`
+domain: ydb.tech
+networkRdma:
+  - matcher: "eth(.*)"
+    resourceCount: 2
+    deviceType: vf
+`)
+		Expect(cfg.NetworkRdma).To(HaveLen(1))
+		Expect(string(cfg.NetworkRdma[0].DeviceType)).To(Equal("vf"))
 	})
 
 	It("parses numaAffinity section", func() {

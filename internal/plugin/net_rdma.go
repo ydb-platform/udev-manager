@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/Mellanox/rdmamap"
@@ -11,6 +12,21 @@ import (
 	"k8s.io/klog/v2"
 
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
+)
+
+// NetRdmaDeviceType restricts networkRdma resources to a particular SR-IOV
+// function type. The zero value disables function-type filtering.
+type NetRdmaDeviceType string
+
+const (
+	// NetRdmaDeviceTypeAny disables PF/VF filtering.
+	NetRdmaDeviceTypeAny NetRdmaDeviceType = ""
+	// NetRdmaDeviceTypePF selects SR-IOV physical functions.
+	NetRdmaDeviceTypePF NetRdmaDeviceType = "pf"
+	// NetRdmaDeviceTypeVF selects SR-IOV virtual functions.
+	NetRdmaDeviceTypeVF NetRdmaDeviceType = "vf"
+
+	netRdmaDeviceTypeUnknown NetRdmaDeviceType = "unknown"
 )
 
 type netRdma struct {
@@ -81,8 +97,34 @@ func NetRdmaMatcherTemplater(domain string, matcher *regexp.Regexp) FromDevice[*
 }
 
 // NetRdmaMatcherInstances returns a FromDevice function that produces
-// resourcesCount netRdma instances for each matching RDMA-capable net device.
-func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesCount int) FromDevice[[]*netRdma] {
+// resourcesCount netRdma instances for each matching RDMA-capable net device
+// of the requested device type.
+func NetRdmaMatcherInstances(
+	domain string,
+	matcher *regexp.Regexp,
+	resourcesCount int,
+	deviceType NetRdmaDeviceType,
+) FromDevice[[]*netRdma] {
+	return netRdmaMatcherInstances(
+		domain,
+		matcher,
+		resourcesCount,
+		deviceType,
+		rdmamap.GetRdmaDeviceForNetdevice,
+		rdmamap.GetRdmaCharDevices,
+		classifyNetRdmaDevice,
+	)
+}
+
+func netRdmaMatcherInstances(
+	domain string,
+	matcher *regexp.Regexp,
+	resourcesCount int,
+	deviceType NetRdmaDeviceType,
+	lookupDevice func(string) (string, error),
+	lookupCharDevices func(string) []string,
+	classifyDevice func(udev.Device) (NetRdmaDeviceType, error),
+) FromDevice[[]*netRdma] {
 	return func(dev udev.Device) ([]*netRdma, error) {
 		if dev.Subsystem() != udev.NetSubsystem {
 			return nil, nil
@@ -97,12 +139,24 @@ func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesCou
 			return nil, nil
 		}
 
-		rdmaDevice, err := rdmamap.GetRdmaDeviceForNetdevice(ifname)
-		if err != nil {
-			klog.Errorf("fail to get rdma devices for network device: %s %v", ifname, err)
+		if deviceType != NetRdmaDeviceTypeAny {
+			actualDeviceType, err := classifyDevice(dev)
+			if err != nil {
+				return nil, fmt.Errorf("classify network interface %q: %w", ifname, err)
+			}
+			if actualDeviceType != deviceType {
+				return nil, nil
+			}
+		}
+
+		rdmaDevice, err := lookupDevice(ifname)
+		if isRdmaNonMatch(ifname, rdmaDevice, err) {
 			return nil, nil
 		}
-		rdmaCharDevices := rdmamap.GetRdmaCharDevices(rdmaDevice)
+		if err != nil {
+			return nil, fmt.Errorf("get RDMA device for network interface %q: %w", ifname, err)
+		}
+		rdmaCharDevices := lookupCharDevices(rdmaDevice)
 		klog.Infof("found rdma character devices for ifname: %s devices: %v", ifname, rdmaCharDevices)
 
 		instances := make([]*netRdma, 0, resourcesCount)
@@ -118,4 +172,55 @@ func NetRdmaMatcherInstances(domain string, matcher *regexp.Regexp, resourcesCou
 
 		return instances, nil
 	}
+}
+
+func classifyNetRdmaDevice(dev udev.Device) (NetRdmaDeviceType, error) {
+	for parent := dev.Parent(); parent != nil; parent = parent.Parent() {
+		if parent.Subsystem() != udev.PciSubsystem {
+			continue
+		}
+
+		attributeKeys := parent.SystemAttributeKeys()
+		attributes := make(map[string]struct{}, len(attributeKeys))
+		for _, attribute := range attributeKeys {
+			attributes[attribute] = struct{}{}
+		}
+
+		if _, ok := attributes[udev.SysAttrPhysfn]; ok {
+			return NetRdmaDeviceTypeVF, nil
+		}
+
+		if _, ok := attributes[udev.SysAttrTotalVFs]; !ok {
+			return netRdmaDeviceTypeUnknown, nil
+		}
+
+		totalVFsString := parent.SystemAttribute(udev.SysAttrTotalVFs)
+		totalVFs, err := strconv.ParseUint(totalVFsString, 10, 32)
+		if err != nil {
+			return netRdmaDeviceTypeUnknown, fmt.Errorf(
+				"parse %s value %q: %w",
+				udev.SysAttrTotalVFs,
+				totalVFsString,
+				err,
+			)
+		}
+		if totalVFs > 0 {
+			return NetRdmaDeviceTypePF, nil
+		}
+		return netRdmaDeviceTypeUnknown, nil
+	}
+
+	return netRdmaDeviceTypeUnknown, nil
+}
+
+func isRdmaNonMatch(ifname, rdmaDevice string, err error) bool {
+	if err == nil {
+		// rdmamap returns an empty device without an error when an IPoIB
+		// interface has no matching RDMA device.
+		return rdmaDevice == ""
+	}
+
+	// rdmamap does not expose sentinel errors for these definitive non-matches.
+	return err.Error() == fmt.Sprintf("rdma device not found for netdev %s", ifname) ||
+		err.Error() == "unknown device type"
 }
