@@ -22,17 +22,25 @@ import (
 type plugin struct {
 	resource  Resource
 	pluginDir string
+	ctx       context.Context
 	cancel    context.CancelFunc
 	stopped   chan struct{} // closed after gRPC server is fully stopped
+	// onStreamBroken is invoked when a ListAndWatch stream ends with an
+	// error while the plugin itself is still running, i.e. the kubelet
+	// dropped the connection. The kubelet never re-opens the stream on its
+	// own — it waits for the plugin to register again.
+	onStreamBroken func(*plugin)
 }
 
-func newPlugin(resource Resource, ctx context.Context, wg *sync.WaitGroup, pluginDir string) (*plugin, error) {
+func newPlugin(resource Resource, ctx context.Context, wg *sync.WaitGroup, pluginDir string, onStreamBroken func(*plugin)) (*plugin, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	plugin := &plugin{
-		resource:  resource,
-		pluginDir: pluginDir,
-		cancel:    cancel,
-		stopped:   make(chan struct{}),
+		resource:       resource,
+		pluginDir:      pluginDir,
+		ctx:            ctx,
+		cancel:         cancel,
+		stopped:        make(chan struct{}),
+		onStreamBroken: onStreamBroken,
 	}
 
 	socketPath := pluginDir + plugin.socketPath()
@@ -96,7 +104,12 @@ func (p *plugin) PreStartContainer(context.Context, *pluginapi.PreStartContainer
 }
 
 func (p *plugin) ListAndWatch(empty *pluginapi.Empty, stream pluginapi.DevicePlugin_ListAndWatchServer) (err error) {
-	defer klog.Infof("%q: closing ListAndWatch connection, err = %v", p.resource.Name(), err)
+	defer func() {
+		klog.Infof("%q: closing ListAndWatch connection, err = %v", p.resource.Name(), err)
+		if err != nil && p.ctx.Err() == nil && p.onStreamBroken != nil {
+			p.onStreamBroken(p)
+		}
+	}()
 
 	ctx := stream.Context()
 	instanceCh := p.resource.ListAndWatch(ctx)
